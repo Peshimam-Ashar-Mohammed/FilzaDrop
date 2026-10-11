@@ -1,0 +1,30 @@
+* { -fx-font-family: "Segoe UI"; }
+.root { -fx-background-color: linear-gradient(to bottom right, #100D1C, #191229 55%, #100D1C); }
+.logo { -fx-min-width:44px; -fx-min-height:44px; -fx-alignment:center; -fx-background-radius:14px; -fx-background-color:linear-gradient(to bottom right,#A78BFA,#6D28D9); -fx-text-fill:white; -fx-font-size:24px; -fx-font-weight:900; -fx-effect:dropshadow(gaussian,#8B5CF655,18,.2,0,4); }
+.brand { -fx-text-fill:#F8F6FF; -fx-font-size:22px; -fx-font-weight:800; }
+.eyebrow { -fx-text-fill:#9F8EC5; -fx-font-size:9px; -fx-font-weight:800; -fx-letter-spacing:2px; }
+.pill { -fx-background-color:#211A31; -fx-background-radius:999; -fx-border-color:#41305E; -fx-border-radius:999; -fx-text-fill:#C5B5F2; -fx-padding:8 12; -fx-font-size:10px; -fx-font-weight:800; }
+.headline { -fx-text-fill:#F9F7FF; -fx-font-size:26px; -fx-font-weight:800; }
+.subtitle { -fx-text-fill:#A69BBE; -fx-font-size:13px; }
+.card { -fx-background-color:linear-gradient(to bottom right,#201831,#191426); -fx-background-radius:20; -fx-border-color:#352747; -fx-border-radius:20; }
+.card-icon { -fx-min-width:40px; -fx-min-height:40px; -fx-alignment:center; -fx-background-color:#322347; -fx-background-radius:13; -fx-text-fill:#C8B5FF; -fx-font-size:25px; -fx-font-weight:800; }
+.card-title { -fx-text-fill:#F7F3FF; -fx-font-size:19px; -fx-font-weight:800; }
+.desc { -fx-text-fill:#A79AB9; -fx-font-size:12px; -fx-wrap-text:true; }
+.field-label { -fx-text-fill:#9C8CB6; -fx-font-size:9px; -fx-font-weight:800; -fx-letter-spacing:1px; }
+.code { -fx-text-fill:#D9C8FF; -fx-font-size:29px; -fx-font-weight:900; -fx-letter-spacing:5px; }
+.muted { -fx-text-fill:#8F83A6; -fx-font-size:10px; -fx-wrap-text:true; }
+.field { -fx-background-color:#110E1B; -fx-background-radius:10; -fx-border-color:#3B2D4D; -fx-border-radius:10; -fx-text-fill:#F4EFFF; -fx-prompt-text-fill:#6F647F; -fx-padding:11 12; -fx-font-size:12px; }
+.field:focused { -fx-border-color:#9B7AF2; }
+.drop-zone { -fx-background-color:#151020; -fx-background-radius:12; -fx-border-color:#51406A; -fx-border-radius:12; -fx-border-style:segments(5,5); -fx-text-fill:#B8A9D1; -fx-alignment:center; -fx-padding:12; -fx-font-size:11px; -fx-cursor:hand; }
+.drop-zone:hover { -fx-background-color:#211831; -fx-border-color:#9B7AF2; }
+.primary { -fx-background-color:linear-gradient(to right,#8B5CF6,#6D28D9); -fx-background-radius:11; -fx-text-fill:white; -fx-font-weight:800; -fx-font-size:12px; -fx-padding:12 16; -fx-cursor:hand; }
+.primary:hover { -fx-background-color:linear-gradient(to right,#A78BFA,#7C3AED); }
+.primary:disabled { -fx-opacity:.48; }
+.secondary { -fx-background-color:#2A2038; -fx-background-radius:11; -fx-border-color:#4A385E; -fx-border-radius:11; -fx-text-fill:#D5C8E8; -fx-font-size:11px; -fx-padding:12 13; -fx-cursor:hand; }
+.wide { -fx-max-width:Infinity; }
+.panel { -fx-background-color:#171221; -fx-background-radius:17; -fx-border-color:#30243F; -fx-border-radius:17; }
+.section-title { -fx-text-fill:#F3EEFF; -fx-font-size:14px; -fx-font-weight:800; }
+.activity { -fx-text-fill:#D8D2E8; -fx-font-size:11px; }
+.progress { -fx-accent:#9B7AF2; }
+.progress > .track { -fx-background-color:#30253F; -fx-background-radius:999; }
+.footer { -fx-text-fill:#675B7A; -fx-font-size:9px; -fx-font-weight:800; -fx-letter-spacing:1.3px; }
