@@ -1,8 +1,10 @@
 package dev.filza.filzadrop.android
 
 import android.content.ContentResolver
+import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -41,6 +43,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.*
 import java.io.*
 import java.net.*
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -82,6 +85,12 @@ data class PeerDevice(
     val activeCode: String
 )
 
+data class SelectedFileItem(
+    val uri: Uri,
+    val name: String,
+    val size: Long
+)
+
 data class TransferDialogState(
     val success: Boolean,
     val title: String,
@@ -97,15 +106,12 @@ fun FilzaDropScreen() {
     var activeCode by remember { mutableStateOf("— — — — — —") }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var inputCode by remember { mutableStateOf("") }
-    var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var selectedFileName by remember { mutableStateOf("Tap to select a file") }
-    var selectedFileSize by remember { mutableStateOf(0L) }
+    var selectedFiles by remember { mutableStateOf<List<SelectedFileItem>>(emptyList()) }
 
     var isReceiving by remember { mutableStateOf(false) }
     var isSending by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
-    var statusText by remember { mutableStateOf("Ready") }
-    var relayEndpoint by remember { mutableStateOf("127.0.0.1:45823") }
+    var statusText by remember { mutableStateOf("Ready · Direct Wi-Fi P2P") }
     var dialogState by remember { mutableStateOf<TransferDialogState?>(null) }
 
     val peers = remember { mutableStateMapOf<String, PeerDevice>() }
@@ -115,6 +121,11 @@ fun FilzaDropScreen() {
     var activeServerSocket by remember { mutableStateOf<ServerSocket?>(null) }
 
     DisposableEffect(Unit) {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val multicastLock = wifiManager?.createMulticastLock("filzadrop-discovery-lock")?.apply {
+            setReferenceCounted(false)
+            try { acquire() } catch (_: Exception) {}
+        }
         val discoveryJob = scope.launch(Dispatchers.IO) {
             AndroidProtocol.runDiscoveryLoop(
                 deviceName = Build.MODEL ?: "Android",
@@ -127,15 +138,20 @@ fun FilzaDropScreen() {
                 }
             )
         }
-        onDispose { discoveryJob.cancel() }
+        onDispose {
+            discoveryJob.cancel()
+            try {
+                if (multicastLock?.isHeld == true) multicastLock.release()
+            } catch (_: Exception) {}
+        }
     }
 
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) {
-            selectedUri = uri
-            val meta = AndroidProtocol.queryFileMeta(context.contentResolver, uri)
-            selectedFileName = meta.first
-            selectedFileSize = meta.second
+    val multiFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        if (uris.isNotEmpty()) {
+            selectedFiles = uris.map { uri ->
+                val meta = AndroidProtocol.queryFileMeta(context.contentResolver, uri)
+                SelectedFileItem(uri, meta.first, meta.second)
+            }
         }
     }
 
@@ -151,7 +167,6 @@ fun FilzaDropScreen() {
         statusText = "Cancelled"
     }
 
-    // Custom Transfer Complete / Failed Dialog
     dialogState?.let { dlg ->
         Dialog(onDismissRequest = { dialogState = null }) {
             Column(
@@ -215,7 +230,18 @@ fun FilzaDropScreen() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text("Send", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text("Select a file and enter the receiver's 6-digit code", color = Color(0xFF786A96), fontSize = 11.sp)
+                Text("Select one or multiple files and enter the 6-digit code", color = Color(0xFF786A96), fontSize = 11.sp)
+
+                val selectionSummary = remember(selectedFiles) {
+                    if (selectedFiles.isEmpty()) {
+                        "Tap to select file(s)"
+                    } else if (selectedFiles.size == 1) {
+                        "${selectedFiles[0].name} (${selectedFiles[0].size / 1024} KB)"
+                    } else {
+                        val totalKb = selectedFiles.sumOf { it.size } / 1024
+                        "${selectedFiles.size} files selected ($totalKb KB total)"
+                    }
+                }
 
                 Box(
                     modifier = Modifier
@@ -223,12 +249,12 @@ fun FilzaDropScreen() {
                         .clip(RoundedCornerShape(8.dp))
                         .background(Color(0xFF0F0B18))
                         .border(1.dp, Color(0xFF2B2042), RoundedCornerShape(8.dp))
-                        .clickable(enabled = !isSending && !isReceiving) { filePicker.launch("*/*") }
+                        .clickable(enabled = !isSending && !isReceiving) { multiFilePicker.launch("*/*") }
                         .padding(16.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (selectedUri == null) "Tap to select a file" else "$selectedFileName (${selectedFileSize / 1024} KB)",
+                        text = selectionSummary,
                         color = Color(0xFFD5C8F0),
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -256,27 +282,30 @@ fun FilzaDropScreen() {
                 if (!isSending) {
                     Button(
                         onClick = {
-                            val uri = selectedUri ?: run {
-                                filePicker.launch("*/*")
+                            if (selectedFiles.isEmpty()) {
+                                multiFilePicker.launch("*/*")
                                 return@Button
                             }
                             if (inputCode.length != 6) {
                                 statusText = "Enter a 6-digit pairing code first"
                                 return@Button
                             }
+                            val filesToSend = selectedFiles
+                            val targetCode = inputCode
                             isSending = true
                             cancelFlag.set(false)
-                            statusText = "Sending $selectedFileName…"
+                            statusText = "Connecting to code $targetCode…"
                             activeJob = scope.launch(Dispatchers.IO) {
                                 try {
-                                    AndroidProtocol.sendFile(
+                                    val resolvedTarget = codeDirectory[targetCode]
+                                        ?: AndroidProtocol.resolveCodeOnLan(targetCode)
+                                        ?: throw IOException("No receiver found on Wi-Fi for code $targetCode.")
+
+                                    AndroidProtocol.sendFiles(
                                         contentResolver = context.contentResolver,
-                                        uri = uri,
-                                        fileName = selectedFileName,
-                                        fileSize = selectedFileSize,
-                                        code = inputCode,
-                                        knownTarget = codeDirectory[inputCode],
-                                        relayEndpoint = relayEndpoint,
+                                        files = filesToSend,
+                                        code = targetCode,
+                                        target = resolvedTarget,
                                         cancelFlag = cancelFlag
                                     ) { sent, total ->
                                         progress = if (total > 0) sent.toFloat() / total else 0f
@@ -284,22 +313,23 @@ fun FilzaDropScreen() {
                                     withContext(Dispatchers.Main) {
                                         isSending = false
                                         progress = 1f
-                                        statusText = "Sent $selectedFileName"
+                                        statusText = "Sent ${filesToSend.size} file(s)"
                                         dialogState = TransferDialogState(
                                             true,
                                             "Transfer Complete",
-                                            "Delivered encrypted file: $selectedFileName"
+                                            "Delivered ${filesToSend.size} encrypted file(s) with SHA-256 verification."
                                         )
                                     }
                                 } catch (e: Exception) {
                                     withContext(Dispatchers.Main) {
                                         isSending = false
+                                        progress = 0f
                                         if (!cancelFlag.get()) {
                                             statusText = "Send failed"
                                             dialogState = TransferDialogState(
                                                 false,
                                                 "Transfer Failed",
-                                                e.message ?: "Could not reach receiver with code $inputCode."
+                                                e.message ?: "Could not reach receiver with code $targetCode."
                                             )
                                         }
                                     }
@@ -310,7 +340,7 @@ fun FilzaDropScreen() {
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
                     ) {
-                        Text("Send", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Text("Send Files", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
                 } else {
                     Button(
@@ -335,7 +365,7 @@ fun FilzaDropScreen() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text("Receive", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text("Share this 6-digit code or QR with the sender", color = Color(0xFF786A96), fontSize = 11.sp)
+                Text("Share this 6-digit code with the sender (Android or Windows)", color = Color(0xFF786A96), fontSize = 11.sp)
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -377,7 +407,7 @@ fun FilzaDropScreen() {
                             if (isSending) return@Button
                             val code = String.format("%06d", SecureRandom().nextInt(1_000_000))
                             activeCode = "${code.substring(0, 3)} ${code.substring(3)}"
-                            qrBitmap = AndroidProtocol.generateQrBitmap("filzadrop://pair?code=$code", 240)
+                            qrBitmap = AndroidProtocol.generateQrBitmap(code, 240)
                             isReceiving = true
                             cancelFlag.set(false)
                             statusText = "Listening with code $code"
@@ -385,7 +415,7 @@ fun FilzaDropScreen() {
                                 try {
                                     val server = ServerSocket(AndroidProtocol.PORT)
                                     activeServerSocket = server
-                                    val savedFile = AndroidProtocol.receiveFile(
+                                    val savedFiles = AndroidProtocol.receiveFiles(
                                         server = server,
                                         code = code,
                                         cancelFlag = cancelFlag
@@ -397,11 +427,12 @@ fun FilzaDropScreen() {
                                         activeCode = "— — — — — —"
                                         qrBitmap = null
                                         progress = 1f
-                                        statusText = "Saved ${savedFile.name}"
+                                        statusText = "Saved ${savedFiles.size} file(s) to Downloads/FilzaDrop"
                                         dialogState = TransferDialogState(
                                             true,
                                             "Transfer Complete",
-                                            "Saved to Downloads:\n${savedFile.absolutePath}"
+                                            "Verified SHA-256 and saved ${savedFiles.size} file(s) to Downloads/FilzaDrop:\n" +
+                                                savedFiles.joinToString("\n") { "• ${it.name}" }
                                         )
                                     }
                                 } catch (e: Exception) {
@@ -409,12 +440,13 @@ fun FilzaDropScreen() {
                                         isReceiving = false
                                         activeCode = "— — — — — —"
                                         qrBitmap = null
+                                        progress = 0f
                                         if (!cancelFlag.get()) {
                                             statusText = "Receive failed"
                                             dialogState = TransferDialogState(
                                                 false,
                                                 "Transfer Failed",
-                                                e.message ?: "Transfer interrupted."
+                                                e.message ?: "Transfer rejected or interrupted."
                                             )
                                         }
                                     }
@@ -425,7 +457,7 @@ fun FilzaDropScreen() {
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
                     ) {
-                        Text("Listen for File", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Text("Listen for Files", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
                 } else {
                     Button(
@@ -449,7 +481,7 @@ fun FilzaDropScreen() {
                     .padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text("Devices", color = Color(0xFF8E7FB0), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                Text("Devices on Wi-Fi", color = Color(0xFF8E7FB0), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 if (peers.isEmpty()) {
                     Text("Searching local network…", color = Color(0xFF786A96), fontSize = 11.sp)
                 } else {
@@ -465,7 +497,7 @@ fun FilzaDropScreen() {
                                 .clickable {
                                     if (peer.activeCode.isNotEmpty()) {
                                         inputCode = peer.activeCode
-                                        statusText = "Selected code ${peer.activeCode}"
+                                        statusText = "Selected code ${peer.activeCode} (${peer.name})"
                                     }
                                 }
                                 .padding(8.dp)
@@ -493,6 +525,8 @@ fun FilzaDropScreen() {
 object AndroidProtocol {
     const val PORT = 45821
     private const val DISCOVERY_PORT = 45822
+    private const val MULTI_HEADER_MAGIC = "FD_MULTI_V2"
+    private const val MAX_BYTES = 10L * 1024 * 1024 * 1024
     private const val SALT = 16
     private const val NONCE = 12
     private const val TAG_BITS = 128
@@ -522,7 +556,69 @@ object AndroidProtocol {
                 if (sizeIdx >= 0) size = cursor.getLong(sizeIdx)
             }
         }
-        return name to size
+        return sanitizeFileName(name) to size
+    }
+
+    fun sanitizeFileName(raw: String): String {
+        val slashStripped = raw.replace('\\', '/').substringAfterLast('/')
+        val cleaned = slashStripped.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim().trimStart('.')
+        if (cleaned.isEmpty() || cleaned == "..") return "received-file"
+        return if (cleaned.length > 180) cleaned.substring(0, 180) else cleaned
+    }
+
+    private fun uniqueFile(dir: File, name: String): File {
+        var candidate = File(dir, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        for (i in 1..9999) {
+            candidate = File(dir, "$base ($i)$ext")
+            if (!candidate.exists()) return candidate
+        }
+        throw IOException("Could not create unique filename in destination.")
+    }
+
+    private fun sendBroadcastOverAllInterfaces(socket: DatagramSocket, data: ByteArray) {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val ni = interfaces.nextElement()
+                if (!ni.isUp || ni.isLoopback || ni.isVirtual) continue
+                for (ia in ni.interfaceAddresses) {
+                    val bcast = ia.broadcast ?: continue
+                    try {
+                        socket.send(DatagramPacket(data, data.size, bcast, DISCOVERY_PORT))
+                    } catch (_: Exception) {}
+                }
+            }
+            socket.send(DatagramPacket(data, data.size, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT))
+        } catch (_: Exception) {}
+    }
+
+    fun resolveCodeOnLan(code: String): InetSocketAddress? {
+        try {
+            DatagramSocket().use { querySocket ->
+                querySocket.broadcast = true
+                querySocket.soTimeout = 300
+                val msg = "FILZADROP_WHOHAS|$code".toByteArray(Charsets.UTF_8)
+                val buf = ByteArray(512)
+                repeat(5) {
+                    sendBroadcastOverAllInterfaces(querySocket, msg)
+                    try {
+                        val packet = DatagramPacket(buf, buf.size)
+                        querySocket.receive(packet)
+                        val text = String(packet.data, packet.offset, packet.length, Charsets.UTF_8)
+                        val parts = text.split("|")
+                        if (parts.size >= 6 && parts[0] == "FILZADROP" && parts[5] == code) {
+                            val port = parts[3].toIntOrNull() ?: PORT
+                            return InetSocketAddress(packet.address.hostAddress ?: return null, port)
+                        }
+                    } catch (_: SocketTimeoutException) {}
+                }
+            }
+        } catch (_: Exception) {}
+        return null
     }
 
     suspend fun runDiscoveryLoop(
@@ -530,6 +626,7 @@ object AndroidProtocol {
         getActiveCode: () -> String,
         onPeer: (PeerDevice) -> Unit
     ) = coroutineScope {
+        val safeDeviceName = deviceName.replace("|", "_")
         val socket = DatagramSocket(null).apply {
             reuseAddress = true
             bind(InetSocketAddress(DISCOVERY_PORT))
@@ -540,9 +637,8 @@ object AndroidProtocol {
             while (isActive) {
                 try {
                     val code = getActiveCode().ifEmpty { "-" }
-                    val msg = "FILZADROP|2|$deviceName|$PORT|Android|$code"
-                    val bytes = msg.toByteArray(Charsets.UTF_8)
-                    socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT))
+                    val msg = "FILZADROP|2|$safeDeviceName|$PORT|Android|$code"
+                    sendBroadcastOverAllInterfaces(socket, msg.toByteArray(Charsets.UTF_8))
                 } catch (_: Exception) {}
                 delay(2000)
             }
@@ -553,6 +649,18 @@ object AndroidProtocol {
                 val packet = DatagramPacket(buf, buf.size)
                 socket.receive(packet)
                 val text = String(packet.data, packet.offset, packet.length, Charsets.UTF_8)
+
+                if (text.startsWith("FILZADROP_WHOHAS|")) {
+                    val wanted = text.substringAfter("FILZADROP_WHOHAS|").trim()
+                    val current = getActiveCode()
+                    if (wanted.isNotEmpty() && wanted == current) {
+                        val reply = "FILZADROP|2|$safeDeviceName|$PORT|Android|$current".toByteArray(Charsets.UTF_8)
+                        socket.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                        socket.send(DatagramPacket(reply, reply.size, packet.address, DISCOVERY_PORT))
+                    }
+                    continue
+                }
+
                 val parts = text.split("|")
                 if (parts.size >= 4 && parts[0] == "FILZADROP") {
                     val peer = PeerDevice(
@@ -568,33 +676,22 @@ object AndroidProtocol {
         }
     }
 
-    fun sendFile(
+    fun sendFiles(
         contentResolver: ContentResolver,
-        uri: Uri,
-        fileName: String,
-        fileSize: Long,
+        files: List<SelectedFileItem>,
         code: String,
-        knownTarget: InetSocketAddress?,
-        relayEndpoint: String,
+        target: InetSocketAddress,
         cancelFlag: AtomicBoolean,
         onProgress: (Long, Long) -> Unit
     ) {
-        val socket = Socket()
-        if (knownTarget != null) {
-            socket.connect(knownTarget, 6000)
-        } else {
-            val parts = relayEndpoint.split(":")
-            socket.connect(InetSocketAddress(parts[0], parts[1].toInt()), 6000)
-            val dOut = DataOutputStream(socket.getOutputStream())
-            val dIn = DataInputStream(socket.getInputStream())
-            dOut.writeUTF("SENDER")
-            dOut.writeUTF(code)
-            dOut.flush()
-            if (dIn.readUTF() != "MATCHED") {
-                socket.close()
-                throw IOException("Code $code not found on LAN or Relay")
-            }
+        val totalBytes = files.sumOf { it.size }
+        if (totalBytes < 0 || totalBytes > MAX_BYTES) {
+            throw IOException("Total transfer size exceeds the 10 GiB limit.")
         }
+
+        val socket = Socket()
+        socket.connect(target, 6000)
+        socket.soTimeout = 30_000
 
         socket.use { s ->
             val rng = SecureRandom()
@@ -608,62 +705,167 @@ object AndroidProtocol {
             raw.flush()
 
             DataOutputStream(CipherOutputStream(raw, cipher)).use { out ->
-                contentResolver.openInputStream(uri)!!.use { input ->
-                    out.writeUTF(fileName)
-                    out.writeLong(fileSize)
-                    val buf = ByteArray(64 * 1024)
-                    var sent = 0L
-                    while (true) {
-                        if (cancelFlag.get()) throw IOException("Cancelled")
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        sent += n
-                        onProgress(sent, fileSize)
+                out.writeUTF(MULTI_HEADER_MAGIC)
+                out.writeInt(files.size)
+                out.writeLong(totalBytes)
+
+                val buf = ByteArray(64 * 1024)
+                var totalSent = 0L
+
+                for (item in files) {
+                    out.writeUTF(sanitizeFileName(item.name))
+                    out.writeLong(item.size)
+                    val sha256 = MessageDigest.getInstance("SHA-256")
+                    val input = contentResolver.openInputStream(item.uri)
+                        ?: throw IOException("Cannot read selected file: ${item.name}")
+                    input.use { stream ->
+                        var sentForFile = 0L
+                        while (true) {
+                            if (cancelFlag.get()) throw IOException("Cancelled")
+                            val n = stream.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            sha256.update(buf, 0, n)
+                            sentForFile += n
+                            totalSent += n
+                            onProgress(totalSent, totalBytes)
+                        }
+                        if (sentForFile != item.size) {
+                            throw IOException("File size changed during transfer: ${item.name}")
+                        }
                     }
-                    out.flush()
+                    out.write(sha256.digest())
                 }
+                out.flush()
             }
         }
     }
 
-    fun receiveFile(
+    fun receiveFiles(
         server: ServerSocket,
         code: String,
         cancelFlag: AtomicBoolean,
         onProgress: (Long, Long) -> Unit
-    ): File {
+    ): List<File> {
         server.soTimeout = 300_000
         val socket = server.accept()
         server.close()
 
+        val downloadsRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val receiveDir = File(downloadsRoot, "FilzaDrop").apply { mkdirs() }
+        val savedFiles = mutableListOf<File>()
+
         socket.use { s ->
+            s.soTimeout = 120_000
+            s.tcpNoDelay = true
             val raw = s.getInputStream()
             val salt = readExact(raw, SALT)
             val nonce = readExact(raw, NONCE)
             val cipher = createCipher(Cipher.DECRYPT_MODE, code, salt, nonce)
 
-            DataInputStream(CipherInputStream(raw, cipher)).use { input ->
-                val name = input.readUTF().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                val size = input.readLong()
-                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val target = File(downloads, name)
-                FileOutputStream(target).buffered().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var got = 0L
-                    while (got < size) {
-                        if (cancelFlag.get()) {
-                            target.delete()
-                            throw IOException("Cancelled")
+            try {
+                DataInputStream(CipherInputStream(raw, cipher)).use { input ->
+                    val firstToken = input.readUTF()
+                    if (firstToken == MULTI_HEADER_MAGIC) {
+                        val fileCount = input.readInt()
+                        val totalBytes = input.readLong()
+                        if (fileCount < 1 || fileCount > 500 || totalBytes < 0 || totalBytes > MAX_BYTES) {
+                            throw IOException("Invalid multi-file header.")
                         }
-                        val n = input.read(buf, 0, minOf(buf.size.toLong(), size - got).toInt())
-                        if (n < 0) throw EOFException("Incomplete file")
-                        out.write(buf, 0, n)
-                        got += n
-                        onProgress(got, size)
+                        var baseOffset = 0L
+                        repeat(fileCount) {
+                            val rawName = input.readUTF()
+                            val fileSize = input.readLong()
+                            val saved = receiveSingleStreamedFile(
+                                input = input,
+                                dir = receiveDir,
+                                rawName = rawName,
+                                size = fileSize,
+                                expectSha256 = true,
+                                cancelFlag = cancelFlag
+                            ) { gotInFile ->
+                                onProgress(baseOffset + gotInFile, totalBytes)
+                            }
+                            baseOffset += fileSize
+                            savedFiles.add(saved)
+                        }
+                    } else {
+                        val fileSize = input.readLong()
+                        val saved = receiveSingleStreamedFile(
+                            input = input,
+                            dir = receiveDir,
+                            rawName = firstToken,
+                            size = fileSize,
+                            expectSha256 = false,
+                            cancelFlag = cancelFlag
+                        ) { got ->
+                            onProgress(got, fileSize)
+                        }
+                        savedFiles.add(saved)
                     }
+                    if (input.read() != -1) {
+                        throw IOException("Unexpected trailing data after payload.")
+                    }
+                    return savedFiles
                 }
-                return target
+            } catch (e: Exception) {
+                savedFiles.forEach { it.delete() }
+                throw e
+            }
+        }
+    }
+
+    private fun receiveSingleStreamedFile(
+        input: DataInputStream,
+        dir: File,
+        rawName: String,
+        size: Long,
+        expectSha256: Boolean,
+        cancelFlag: AtomicBoolean,
+        onBytes: (Long) -> Unit
+    ): File {
+        if (size < 0 || size > MAX_BYTES) {
+            throw IOException("Invalid file size.")
+        }
+        val cleanName = sanitizeFileName(rawName)
+        val tempFile = File.createTempFile(".filzadrop-", ".part", dir)
+        var committed = false
+        try {
+            val sha256 = MessageDigest.getInstance("SHA-256")
+            FileOutputStream(tempFile).buffered().use { out ->
+                val buf = ByteArray(64 * 1024)
+                var got = 0L
+                while (got < size) {
+                    if (cancelFlag.get()) {
+                        throw IOException("Cancelled")
+                    }
+                    val toRead = minOf(buf.size.toLong(), size - got).toInt()
+                    val n = input.read(buf, 0, toRead)
+                    if (n < 0) throw EOFException("Connection closed before full file arrived.")
+                    out.write(buf, 0, n)
+                    sha256.update(buf, 0, n)
+                    got += n
+                    onBytes(got)
+                }
+            }
+            if (expectSha256) {
+                val expectedHash = ByteArray(32)
+                input.readFully(expectedHash)
+                val actualHash = sha256.digest()
+                if (!MessageDigest.isEqual(expectedHash, actualHash)) {
+                    throw IOException("SHA-256 integrity mismatch for $cleanName")
+                }
+            }
+            val finalFile = uniqueFile(dir, cleanName)
+            if (!tempFile.renameTo(finalFile)) {
+                tempFile.copyTo(finalFile, overwrite = true)
+                tempFile.delete()
+            }
+            committed = true
+            return finalFile
+        } finally {
+            if (!committed) {
+                tempFile.delete()
             }
         }
     }
@@ -671,8 +873,13 @@ object AndroidProtocol {
     private fun createCipher(mode: Int, code: String, salt: ByteArray, nonce: ByteArray): Cipher {
         val spec = PBEKeySpec(code.toCharArray(), salt, ITERATIONS, 256)
         val key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
-        return Cipher.getInstance("AES/GCM/NoPadding").apply {
-            init(mode, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_BITS, nonce))
+        try {
+            return Cipher.getInstance("AES/GCM/NoPadding").apply {
+                init(mode, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_BITS, nonce))
+            }
+        } finally {
+            key.fill(0)
+            spec.clearPassword()
         }
     }
 
@@ -681,7 +888,7 @@ object AndroidProtocol {
         var off = 0
         while (off < len) {
             val n = input.read(b, off, len - off)
-            if (n < 0) throw EOFException()
+            if (n < 0) throw EOFException("Handshake truncated.")
             off += n
         }
         return b
