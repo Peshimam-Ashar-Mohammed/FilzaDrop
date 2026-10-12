@@ -33,6 +33,69 @@ final class TransferService {
         return "Find this PC's IPv4 address";
     }
 
+    static String getLocalIpv4Hint() {
+        try {
+            var interfaces =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+
+            String fallback = null;
+
+            while (interfaces.hasMoreElements()) {
+                var ni = interfaces.nextElement();
+
+                if (!ni.isUp() || ni.isLoopback() || ni.isVirtual()) {
+                    continue;
+                }
+
+                String name = (
+                        ni.getName() + " " + ni.getDisplayName()
+                ).toLowerCase(java.util.Locale.ROOT);
+
+                if (name.contains("wsl")
+                        || name.contains("virtual")
+                        || name.contains("vmware")
+                        || name.contains("virtualbox")
+                        || name.contains("vethernet")) {
+                    continue;
+                }
+
+                var addresses = ni.getInetAddresses();
+
+                while (addresses.hasMoreElements()) {
+                    var address = addresses.nextElement();
+
+                    if (!(address instanceof java.net.Inet4Address)
+                            || address.isLoopbackAddress()
+                            || address.isLinkLocalAddress()) {
+                        continue;
+                    }
+
+                    String ip = address.getHostAddress();
+                    String interfaceName = ni.getName()
+                            .toLowerCase(java.util.Locale.ROOT);
+                    String displayName = ni.getDisplayName()
+                            .toLowerCase(java.util.Locale.ROOT);
+
+                    if (interfaceName.contains("wi-fi")
+                            || displayName.contains("wi-fi")
+                            || interfaceName.contains("wlan")) {
+                        return ip;
+                    }
+
+                    if (fallback == null) {
+                        fallback = ip;
+                    }
+                }
+            }
+
+            return fallback != null
+                    ? fallback
+                    : "No suitable LAN IPv4 address found";
+        } catch (java.net.SocketException ex) {
+            return "Unable to detect LAN address";
+        }
+    }
+
     static void send(Path file, String host, int port, String code, LongConsumer progress) throws Exception {
         long size = Files.size(file); if (size > MAX_BYTES) throw new IOException("Maximum file size in this version is 10 GiB.");
         byte[] salt = random(SALT), nonce = random(NONCE); Cipher cipher = cipher(Cipher.ENCRYPT_MODE, code, salt, nonce);
