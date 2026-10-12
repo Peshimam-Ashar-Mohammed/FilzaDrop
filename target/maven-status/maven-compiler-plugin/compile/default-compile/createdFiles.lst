@@ -1,9 +1,11 @@
-dev\filza\filzadrop\FilzaDropApp$4.class
-dev\filza\filzadrop\FilzaDropApp$TransferTarget.class
 dev\filza\filzadrop\FilzaDropApp.class
+dev\filza\filzadrop\RelayServer.class
+dev\filza\filzadrop\LanDiscoveryService$DiscoveredPeer.class
 dev\filza\filzadrop\LanDiscoveryService.class
 dev\filza\filzadrop\FilzaDropApp$1.class
+dev\filza\filzadrop\TransferService$CancellationException.class
 dev\filza\filzadrop\FilzaDropApp$2.class
 dev\filza\filzadrop\TransferService.class
-dev\filza\filzadrop\FilzaDropApp$3.class
+dev\filza\filzadrop\MobileWebBridge.class
+dev\filza\filzadrop\TransferService$TransferHandle.class
 dev\filza\filzadrop\LanScanner.class
