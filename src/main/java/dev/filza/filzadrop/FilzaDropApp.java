@@ -1,14 +1,17 @@
 package dev.filza.filzadrop;
 
+import java.awt.Desktop;
 import java.io.File;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 import javafx.application.Application;
 import javafx.application.Platform;
@@ -54,7 +57,7 @@ public class FilzaDropApp extends Application {
     private Button sendButton;
     private Button cancelSendButton;
     private FlowPane peerChips;
-    private Path chosenFile;
+    private List<Path> chosenFiles = new ArrayList<>();
 
     private ServerSocket server;
     private LanDiscoveryService discoveryService;
@@ -77,13 +80,13 @@ public class FilzaDropApp extends Application {
         scrollPane.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
         scrollPane.getStyleClass().add("main-scroll");
 
-        Scene scene = new Scene(scrollPane, 800, 560);
+        Scene scene = new Scene(scrollPane, 840, 570);
         scene.getStylesheets().add(
                 getClass().getResource("/styles.css").toExternalForm()
         );
 
         stage.setTitle("FilzaDrop");
-        stage.setMinWidth(600);
+        stage.setMinWidth(620);
         stage.setMinHeight(480);
         stage.setScene(scene);
         stage.show();
@@ -96,20 +99,28 @@ public class FilzaDropApp extends Application {
         } catch (IOException ignored) {
         }
 
-        mobileWebBridge = new MobileWebBridge(receivedPath -> Platform.runLater(() -> {
+        mobileWebBridge = new MobileWebBridge(receivedPaths -> Platform.runLater(() -> {
+            // Cancel the parallel TCP listener first so closing ServerSocket does not trigger a false error dialog
+            if (activeHandle != null) {
+                activeHandle.cancel();
+            }
             finishTransfer();
             progress.setProgress(1);
-            progressText.setText("Saved " + receivedPath.getFileName());
-            setStatus("Received from Android");
+            String summary = formatReceivedFilesSummary(receivedPaths);
+            progressText.setText("Saved " + receivedPaths.size() + " file(s)");
+            setStatus("Received from phone into Downloads/FilzaDrop");
             showTransferResultDialog(
                     true,
                     "Transfer Complete",
-                    "Received file from phone and saved to:\n" + receivedPath,
-                    receivedPath,
+                    "Received from phone:\n" + summary + "\n\nSaved in: " + TransferService.receiveDir(),
+                    TransferService.receiveDir(),
                     null
             );
         }));
-        mobileWebBridge.start();
+        try {
+            mobileWebBridge.start();
+        } catch (IOException ignored) {
+        }
 
         String deviceName = System.getProperty("user.name", "PC");
         discoveryService = new LanDiscoveryService(
@@ -141,15 +152,27 @@ public class FilzaDropApp extends Application {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
+        Button privacyBtn = new Button("Direct · No Cloud");
+        privacyBtn.getStyleClass().add("ghost-button");
+        privacyBtn.setOnAction(e -> showPrivacyDialog());
+
+        Button helpBtn = new Button("How It Works");
+        helpBtn.getStyleClass().add("ghost-button");
+        helpBtn.setOnAction(e -> showHelpDialog());
+
         Button qrModalBtn = new Button("Phone QR");
         qrModalBtn.getStyleClass().add("ghost-button");
         qrModalBtn.setOnAction(e -> showPhoneQrDialog());
+
+        Button downloadsBtn = new Button("Downloads Folder");
+        downloadsBtn.getStyleClass().add("ghost-button");
+        downloadsBtn.setOnAction(e -> openDownloadsFolder());
 
         Button relayBtn = new Button("Relay");
         relayBtn.getStyleClass().add("ghost-button");
         relayBtn.setOnAction(e -> showRelayDialog());
 
-        HBox topBar = new HBox(8, brand, spacer, qrModalBtn, relayBtn);
+        HBox topBar = new HBox(8, brand, spacer, privacyBtn, helpBtn, qrModalBtn, downloadsBtn, relayBtn);
         topBar.setAlignment(Pos.CENTER_LEFT);
         return topBar;
     }
@@ -167,10 +190,10 @@ public class FilzaDropApp extends Application {
 
     private VBox createSendPane() {
         Label header = styledLabel("Send", "pane-title");
-        Label sub = styledLabel("Select a file and enter the receiver's 6-digit code", "pane-sub");
+        Label sub = styledLabel("Select one or multiple files and enter the 6-digit code", "pane-sub");
 
-        fileLabel = styledLabel("Drop file or click to browse", "drop-title");
-        fileMetaLabel = styledLabel("Up to 10 GB · AES-256-GCM", "drop-meta");
+        fileLabel = styledLabel("Drop files or click to browse", "drop-title");
+        fileMetaLabel = styledLabel("Multiple files supported · Up to 10 GB · AES-256-GCM", "drop-meta");
 
         VBox dropZone = new VBox(4, fileLabel, fileMetaLabel);
         dropZone.setAlignment(Pos.CENTER);
@@ -186,7 +209,7 @@ public class FilzaDropApp extends Application {
         codeField.setAlignment(Pos.CENTER);
         codeField.textProperty().addListener((obs, oldV, newV) -> keepPairingCodeDigits(newV));
 
-        sendButton = new Button("Send");
+        sendButton = new Button("Send Files");
         sendButton.getStyleClass().addAll("primary-btn", "wide");
         sendButton.setOnAction(e -> sendFile());
 
@@ -237,7 +260,7 @@ public class FilzaDropApp extends Application {
 
         Label saveHint = styledLabel("Saves to Downloads/FilzaDrop · Click code to copy", "pane-sub");
 
-        receiveButton = new Button("Listen for File");
+        receiveButton = new Button("Listen for Files");
         receiveButton.getStyleClass().addAll("primary-btn", "wide");
         receiveButton.setOnAction(e -> startReceiving());
 
@@ -311,7 +334,7 @@ public class FilzaDropApp extends Application {
 
     private void configureFileDropZone(VBox dropZone) {
         dropZone.setOnMouseClicked(event -> {
-            if (!busy) chooseFile();
+            if (!busy) chooseFiles();
         });
         dropZone.setOnDragOver(event -> {
             if (!busy && event.getDragboard().hasFiles()) {
@@ -322,7 +345,13 @@ public class FilzaDropApp extends Application {
         dropZone.setOnDragDropped(event -> {
             boolean accepted = !busy && event.getDragboard().hasFiles();
             if (accepted) {
-                setFile(event.getDragboard().getFiles().get(0).toPath());
+                List<Path> paths = event.getDragboard().getFiles().stream()
+                        .map(File::toPath)
+                        .filter(Files::isRegularFile)
+                        .toList();
+                if (!paths.isEmpty()) {
+                    setFiles(paths);
+                }
             }
             event.setDropCompleted(accepted);
             event.consume();
@@ -354,10 +383,10 @@ public class FilzaDropApp extends Application {
             progress.setProgress(ProgressBar.INDETERMINATE_PROGRESS);
             progressText.setText("Waiting for sender");
 
-            Task<Path> task = new Task<>() {
+            Task<List<Path>> task = new Task<>() {
                 @Override
-                protected Path call() throws Exception {
-                    return TransferService.receiveAnyNetwork(
+                protected List<Path> call() throws Exception {
+                    return TransferService.receiveFilesAnyNetwork(
                             server,
                             code,
                             TransferService.receiveDir(),
@@ -368,16 +397,17 @@ public class FilzaDropApp extends Application {
             };
 
             task.setOnSucceeded(event -> {
-                Path receivedFile = task.getValue();
+                List<Path> receivedFiles = task.getValue();
                 finishTransfer();
                 progress.setProgress(1);
-                progressText.setText(receivedFile.getFileName().toString());
-                setStatus("Saved to " + receivedFile);
+                String summary = formatReceivedFilesSummary(receivedFiles);
+                progressText.setText("Saved " + receivedFiles.size() + " file(s)");
+                setStatus("Saved to " + TransferService.receiveDir());
                 showTransferResultDialog(
                         true,
                         "Transfer Complete",
-                        "Verified and saved:\n" + receivedFile.getFileName() + "\n\nLocation: " + receivedFile.getParent(),
-                        receivedFile,
+                        "Verified (AES-256-GCM + SHA-256) and saved:\n" + summary + "\n\nFolder: " + TransferService.receiveDir(),
+                        TransferService.receiveDir(),
                         null
                 );
             });
@@ -419,9 +449,11 @@ public class FilzaDropApp extends Application {
     private void sendFile() {
         if (busy) return;
 
-        if (chosenFile == null || !Files.isRegularFile(chosenFile)) {
-            chooseFile();
-            if (chosenFile == null || !Files.isRegularFile(chosenFile)) return;
+        List<Path> validFiles = chosenFiles.stream().filter(Files::isRegularFile).toList();
+        if (validFiles.isEmpty()) {
+            chooseFiles();
+            validFiles = chosenFiles.stream().filter(Files::isRegularFile).toList();
+            if (validFiles.isEmpty()) return;
         }
 
         String code = codeField.getText().replaceAll("\\D", "");
@@ -431,22 +463,22 @@ public class FilzaDropApp extends Application {
             return;
         }
 
-        Path file = chosenFile;
+        final List<Path> filesToSend = validFiles;
         activeHandle = new TransferService.TransferHandle();
         if (mobileWebBridge != null) {
-            mobileWebBridge.registerOutgoingFile(code, file);
+            mobileWebBridge.registerOutgoingFiles(code, filesToSend);
         }
 
         setTransferMode(true, false);
         progress.setProgress(ProgressBar.INDETERMINATE_PROGRESS);
         progressText.setText("Connecting");
-        setStatus("Sending " + file.getFileName() + "…");
+        setStatus("Sending " + filesToSend.size() + " file(s)…");
 
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() throws Exception {
-                TransferService.sendByCode(
-                        file,
+                TransferService.sendFilesByCode(
+                        filesToSend,
                         code,
                         discoveryService,
                         activeHandle,
@@ -460,11 +492,12 @@ public class FilzaDropApp extends Application {
             finishTransfer();
             progress.setProgress(1);
             progressText.setText("100%");
-            setStatus("Sent " + file.getFileName());
+            String summary = formatReceivedFilesSummary(filesToSend);
+            setStatus("Sent " + filesToSend.size() + " file(s)");
             showTransferResultDialog(
                     true,
                     "Transfer Complete",
-                    "Delivered encrypted file:\n" + file.getFileName() + " (" + fileMetaLabel.getText().replace(" · Click to change", "") + ")",
+                    "Delivered " + filesToSend.size() + " encrypted file(s):\n" + summary,
                     null,
                     null
             );
@@ -484,7 +517,8 @@ public class FilzaDropApp extends Application {
                 showTransferResultDialog(
                         false,
                         "Transfer Failed",
-                        message(ex) + "\n\nEnsure the receiving device is listening with code " + code + ".",
+                        message(ex) + "\n\nEnsure the receiving device is listening with code " + code
+                                + ", or click 'Phone QR' if sending to a phone browser.",
                         null,
                         this::sendFile
                 );
@@ -494,11 +528,122 @@ public class FilzaDropApp extends Application {
         startTask(task, "filzadrop-sender");
     }
 
+    private String formatReceivedFilesSummary(List<Path> files) {
+        if (files == null || files.isEmpty()) return "";
+        if (files.size() <= 4) {
+            return files.stream()
+                    .map(p -> "• " + p.getFileName())
+                    .collect(Collectors.joining("\n"));
+        }
+        return files.subList(0, 3).stream()
+                .map(p -> "• " + p.getFileName())
+                .collect(Collectors.joining("\n"))
+                + "\n• +" + (files.size() - 3) + " more file(s)";
+    }
+
+    private void openDownloadsFolder() {
+        try {
+            Path dir = TransferService.receiveDir().toAbsolutePath();
+            Files.createDirectories(dir);
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(dir.toFile());
+            } else {
+                new ProcessBuilder("explorer.exe", dir.toString()).start();
+            }
+            setStatus("Opened " + dir);
+        } catch (Exception ex) {
+            setStatus("Downloads folder: " + TransferService.receiveDir());
+        }
+    }
+
+    private void showHelpDialog() {
+        Stage dialog = new Stage(StageStyle.TRANSPARENT);
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.APPLICATION_MODAL);
+
+        Label badge = styledLabel("GUIDE", "dialog-badge-ok");
+        Label heading = styledLabel("How to Transfer Between Phone & Laptop", "dialog-title");
+        Label body = styledLabel(
+                "1. Connect Both Devices\n" +
+                "   Connect your phone and laptop to the same Wi-Fi network (or turn on your phone's Mobile Hotspot and connect your laptop to it).\n\n" +
+                "2. Phone → Laptop (Receive on PC)\n" +
+                "   • Click 'Listen for Files' on your laptop.\n" +
+                "   • Scan the QR code shown on your laptop with your phone's camera.\n" +
+                "   • Pick one or multiple files on your phone and tap 'Send Files'.\n\n" +
+                "3. Laptop → Phone (Send to Phone)\n" +
+                "   • Select one or multiple files in the 'Send' box on your laptop.\n" +
+                "   • Click 'Phone QR' at the top and scan the QR code with your phone.\n" +
+                "   • Tap 'Receive Files' on your phone to download them directly.\n\n" +
+                "4. Laptop ↔ Laptop\n" +
+                "   • Click 'Listen for Files' on the receiving PC to get a 6-digit code.\n" +
+                "   • Select files on the sending PC, enter the 6-digit code, and click 'Send Files'.",
+                "dialog-body"
+        );
+        body.setWrapText(true);
+
+        Button closeBtn = new Button("Got It");
+        closeBtn.getStyleClass().add("primary-btn");
+        closeBtn.setOnAction(e -> dialog.close());
+
+        HBox actions = new HBox(closeBtn);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        VBox card = new VBox(14, badge, heading, body, actions);
+        card.setPadding(new Insets(22));
+        card.setPrefWidth(460);
+        card.getStyleClass().add("dialog-card-ok");
+
+        Scene scene = new Scene(card);
+        scene.setFill(Color.TRANSPARENT);
+        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        dialog.setScene(scene);
+        dialog.showAndWait();
+    }
+
+    private void showPrivacyDialog() {
+        Stage dialog = new Stage(StageStyle.TRANSPARENT);
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.APPLICATION_MODAL);
+
+        Label badge = styledLabel("ZERO-CLOUD ARCHITECTURE", "dialog-badge-ok");
+        Label heading = styledLabel("Direct Peer-to-Peer · Nothing Stored on Any Backend", "dialog-title");
+        Label body = styledLabel(
+                "• No Cloud Storage or Servers:\n" +
+                "  Your files are never uploaded to any third-party server, database, or cloud bucket. Bytes stream directly from the sender's device into your local Downloads/FilzaDrop folder.\n\n" +
+                "• No Accounts or Tracking:\n" +
+                "  FilzaDrop requires no sign-up, collects no telemetry, and stores zero file metadata externally.\n\n" +
+                "• End-to-End Authenticated Encryption:\n" +
+                "  Desktop-to-desktop and native app transfers are encrypted using AES-256-GCM (PBKDF2-HMAC-SHA256 with 310,000 iterations) and verified with SHA-256 integrity hashes before saving.\n\n" +
+                "• One-Time Ephemeral Pairing Codes:\n" +
+                "  Every 6-digit pairing code is generated with SecureRandom, expires automatically, locks out after repeated failed guesses, and is destroyed immediately after the transfer completes.",
+                "dialog-body"
+        );
+        body.setWrapText(true);
+
+        Button closeBtn = new Button("Close");
+        closeBtn.getStyleClass().add("primary-btn");
+        closeBtn.setOnAction(e -> dialog.close());
+
+        HBox actions = new HBox(closeBtn);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        VBox card = new VBox(14, badge, heading, body, actions);
+        card.setPadding(new Insets(22));
+        card.setPrefWidth(460);
+        card.getStyleClass().add("dialog-card-ok");
+
+        Scene scene = new Scene(card);
+        scene.setFill(Color.TRANSPARENT);
+        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        dialog.setScene(scene);
+        dialog.showAndWait();
+    }
+
     private void showTransferResultDialog(
             boolean success,
             String title,
             String detail,
-            Path savedFile,
+            Path folderToOpen,
             Runnable onRetry
     ) {
         Stage dialog = new Stage(StageStyle.TRANSPARENT);
@@ -513,13 +658,11 @@ public class FilzaDropApp extends Application {
         HBox actions = new HBox(10);
         actions.setAlignment(Pos.CENTER_RIGHT);
 
-        if (savedFile != null) {
-            Button openFolderBtn = new Button("Open Folder");
+        if (folderToOpen != null) {
+            Button openFolderBtn = new Button("Open Downloads Folder");
             openFolderBtn.getStyleClass().add("ghost-button");
             openFolderBtn.setOnAction(e -> {
-                try {
-                    new ProcessBuilder("explorer.exe", "/select," + savedFile.toAbsolutePath()).start();
-                } catch (IOException ignored) {}
+                openDownloadsFolder();
                 dialog.close();
             });
             actions.getChildren().add(openFolderBtn);
@@ -542,7 +685,7 @@ public class FilzaDropApp extends Application {
 
         VBox card = new VBox(14, badge, heading, body, actions);
         card.setPadding(new Insets(22));
-        card.setPrefWidth(380);
+        card.setPrefWidth(400);
         card.getStyleClass().add(success ? "dialog-card-ok" : "dialog-card-err");
 
         Scene scene = new Scene(card);
@@ -557,12 +700,13 @@ public class FilzaDropApp extends Application {
         if (activeCode.isEmpty() && !codeField.getText().isBlank()) {
             activeCode = codeField.getText().replaceAll("\\D", "");
         }
-        if (activeCode.isEmpty() && chosenFile != null) {
+        List<Path> validFiles = chosenFiles.stream().filter(Files::isRegularFile).toList();
+        if (activeCode.isEmpty() && !validFiles.isEmpty()) {
             activeCode = TransferService.newCode();
             codeField.setText(activeCode);
-            if (mobileWebBridge != null) {
-                mobileWebBridge.registerOutgoingFile(activeCode, chosenFile);
-            }
+        }
+        if (!activeCode.isEmpty() && !validFiles.isEmpty() && mobileWebBridge != null) {
+            mobileWebBridge.registerOutgoingFiles(activeCode, validFiles);
         }
 
         String url = mobileWebBridge != null
@@ -573,13 +717,14 @@ public class FilzaDropApp extends Application {
         dialog.initOwner(stage);
         dialog.initModality(Modality.APPLICATION_MODAL);
 
-        Label heading = styledLabel("Scan with Android Phone", "dialog-title");
+        Label heading = styledLabel("Scan with Phone Camera", "dialog-title");
         Label sub = styledLabel(
                 activeCode.isEmpty()
-                        ? "Scan to open FilzaDrop on your phone"
-                        : "Paired with code " + activeCode + " · Open camera to scan",
+                        ? "Click 'Listen for Files' or select files to send first, or scan to open portal:"
+                        : "Paired with code " + activeCode + " · Scan to send or receive on your phone",
                 "dialog-body"
         );
+        sub.setWrapText(true);
 
         ImageView qr = new ImageView(QrGenerator.generate(url, 200));
         VBox qrWrap = new VBox(qr);
@@ -606,7 +751,7 @@ public class FilzaDropApp extends Application {
         VBox card = new VBox(14, heading, sub, qrWrap, urlLabel, actions);
         card.setAlignment(Pos.CENTER);
         card.setPadding(new Insets(22));
-        card.setPrefWidth(340);
+        card.setPrefWidth(360);
         card.getStyleClass().add("dialog-card-ok");
 
         Scene scene = new Scene(card);
@@ -728,22 +873,34 @@ public class FilzaDropApp extends Application {
         }
     }
 
-    private void chooseFile() {
+    private void chooseFiles() {
         FileChooser chooser = new FileChooser();
-        chooser.setTitle("Select File");
-        File file = chooser.showOpenDialog(stage);
-        if (file != null) {
-            setFile(file.toPath());
+        chooser.setTitle("Select File(s) to Send");
+        Path downloads = Path.of(System.getProperty("user.home"), "Downloads");
+        if (Files.isDirectory(downloads)) {
+            chooser.setInitialDirectory(downloads.toFile());
+        }
+        List<File> files = chooser.showOpenMultipleDialog(stage);
+        if (files != null && !files.isEmpty()) {
+            setFiles(files.stream().map(File::toPath).toList());
         }
     }
 
-    private void setFile(Path path) {
-        chosenFile = path;
+    private void setFiles(List<Path> paths) {
+        chosenFiles = new ArrayList<>(paths);
         try {
-            fileLabel.setText(path.getFileName().toString());
-            fileMetaLabel.setText(TransferService.bytes(Files.size(path)) + " · Click to change");
+            long totalBytes = 0;
+            for (Path p : chosenFiles) {
+                totalBytes += Files.size(p);
+            }
+            if (chosenFiles.size() == 1) {
+                fileLabel.setText(chosenFiles.get(0).getFileName().toString());
+            } else {
+                fileLabel.setText(chosenFiles.size() + " files selected (" + chosenFiles.get(0).getFileName() + " + " + (chosenFiles.size() - 1) + " more)");
+            }
+            fileMetaLabel.setText(TransferService.bytes(totalBytes) + " total · Click to change");
         } catch (IOException ex) {
-            fileLabel.setText("Cannot read file");
+            fileLabel.setText("Cannot read selected file(s)");
         }
     }
 

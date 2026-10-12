@@ -11,6 +11,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.file.*;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,9 +23,10 @@ import java.util.function.BiConsumer;
 
 public final class TransferService {
     public static final int PORT = 45821;
+    public static final long MAX_BYTES = 10L * 1024 * 1024 * 1024;
     private static final SecureRandom RNG = new SecureRandom();
     private static final int SALT = 16, NONCE = 12, TAG_BITS = 128, BUFFER = 64 * 1024, ITERATIONS = 310_000;
-    private static final long MAX_BYTES = 10L * 1024 * 1024 * 1024;
+    private static final String MULTI_HEADER_MAGIC = "FD_MULTI_V2";
 
     private static volatile String relayHost = System.getProperty("filzadrop.relay", "127.0.0.1");
     private static volatile int relayPort = Integer.getInteger("filzadrop.relay.port", RelayServer.DEFAULT_RELAY_PORT);
@@ -44,9 +46,6 @@ public final class TransferService {
         return relayHost + ":" + relayPort;
     }
 
-    /**
-     * Generates a clean 6-digit pairing code.
-     */
     public static String newCode() {
         return String.format(Locale.ROOT, "%06d", RNG.nextInt(1_000_000));
     }
@@ -86,9 +85,6 @@ public final class TransferService {
         }
     }
 
-    /**
-     * Active session handle that allows instant cancellation of either send or receive.
-     */
     public static final class TransferHandle implements AutoCloseable {
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
         private final List<Closeable> closeables = new ArrayList<>();
@@ -123,11 +119,6 @@ public final class TransferService {
         }
     }
 
-    /**
-     * Sends a file using ONLY the pairing code:
-     * 1. Resolves via LAN Discovery if on the same network
-     * 2. Falls back to Cross-Network Relay Server if across different networks
-     */
     public static void sendByCode(
             Path file,
             String code,
@@ -135,31 +126,42 @@ public final class TransferService {
             TransferHandle handle,
             BiConsumer<Long, Long> progress
     ) throws Exception {
+        sendFilesByCode(List.of(file), code, discovery, handle, progress);
+    }
+
+    public static void sendFilesByCode(
+            List<Path> files,
+            String code,
+            LanDiscoveryService discovery,
+            TransferHandle handle,
+            BiConsumer<Long, Long> progress
+    ) throws Exception {
+        if (files == null || files.isEmpty()) {
+            throw new IllegalArgumentException("No files selected.");
+        }
         Optional<InetSocketAddress> lanTarget = discovery != null ? discovery.resolveCode(code) : Optional.empty();
         if (lanTarget.isPresent()) {
             InetSocketAddress addr = lanTarget.get();
-            sendDirect(file, addr.getHostString(), addr.getPort(), code, handle, progress);
+            sendFilesDirect(files, addr.getHostString(), addr.getPort(), code, handle, progress);
             return;
         }
 
-        // Try Cross-Network Relay Server
         try {
             Socket relaySocket = connectRelayAsSender(code, handle);
-            sendOverSocket(file, relaySocket, code, handle, progress);
+            sendFilesOverSocket(files, relaySocket, code, handle, progress);
             return;
         } catch (IOException relayEx) {
-            // Final fallback: try localhost direct if testing on same machine
             try {
-                sendDirect(file, "127.0.0.1", PORT, code, handle, progress);
+                sendFilesDirect(files, "127.0.0.1", PORT, code, handle, progress);
                 return;
             } catch (Exception ignored) {
             }
-            throw new IOException("No active receiver found for code " + code + " on LAN or Relay.", relayEx);
+            throw new IOException("No active receiver found for code " + code + ".", relayEx);
         }
     }
 
-    public static void sendDirect(
-            Path file,
+    public static void sendFilesDirect(
+            List<Path> files,
             String host,
             int port,
             String code,
@@ -170,18 +172,25 @@ public final class TransferService {
         handle.register(socket);
         socket.connect(new InetSocketAddress(host, port), 6_000);
         socket.setSoTimeout(30_000);
-        sendOverSocket(file, socket, code, handle, progress);
+        sendFilesOverSocket(files, socket, code, handle, progress);
     }
 
-    private static void sendOverSocket(
-            Path file,
+    private static void sendFilesOverSocket(
+            List<Path> files,
             Socket socket,
             String code,
             TransferHandle handle,
             BiConsumer<Long, Long> progress
     ) throws Exception {
-        long size = Files.size(file);
-        if (size > MAX_BYTES) throw new IOException("Maximum file size is 10 GiB.");
+        long totalBytes = 0;
+        for (Path f : files) {
+            long sz = Files.size(f);
+            if (sz < 0 || totalBytes + sz > MAX_BYTES) {
+                throw new IOException("Total transfer size exceeds the 10 GiB limit.");
+            }
+            totalBytes += sz;
+        }
+
         byte[] salt = random(SALT), nonce = random(NONCE);
         Cipher cipher = cipher(Cipher.ENCRYPT_MODE, code, salt, nonce);
 
@@ -191,20 +200,34 @@ public final class TransferService {
             raw.write(nonce);
             raw.flush();
 
-            try (DataOutputStream out = new DataOutputStream(new CipherOutputStream(raw, cipher));
-                 InputStream in = new BufferedInputStream(Files.newInputStream(file))) {
-                out.writeUTF(file.getFileName().toString());
-                out.writeLong(size);
+            try (DataOutputStream out = new DataOutputStream(new CipherOutputStream(raw, cipher))) {
+                out.writeUTF(MULTI_HEADER_MAGIC);
+                out.writeInt(files.size());
+                out.writeLong(totalBytes);
+
                 byte[] buf = new byte[BUFFER];
-                long sent = 0;
-                int n;
-                while ((n = in.read(buf)) != -1) {
-                    if (handle.isCancelled()) {
-                        throw new CancellationException("Transfer cancelled.");
+                long totalSent = 0;
+
+                for (Path file : files) {
+                    long fileSize = Files.size(file);
+                    out.writeUTF(file.getFileName().toString());
+                    out.writeLong(fileSize);
+
+                    MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+                    try (InputStream in = new BufferedInputStream(Files.newInputStream(file))) {
+                        int n;
+                        while ((n = in.read(buf)) != -1) {
+                            if (handle.isCancelled()) {
+                                throw new CancellationException("Transfer cancelled.");
+                            }
+                            out.write(buf, 0, n);
+                            sha256.update(buf, 0, n);
+                            totalSent += n;
+                            progress.accept(totalSent, totalBytes);
+                        }
                     }
-                    out.write(buf, 0, n);
-                    sent += n;
-                    progress.accept(sent, size);
+                    byte[] digest = sha256.digest();
+                    out.write(digest);
                 }
                 out.flush();
             }
@@ -216,11 +239,7 @@ public final class TransferService {
         }
     }
 
-    /**
-     * Listens simultaneously on Direct TCP (for LAN/Android speed) AND Cross-Network Relay Server.
-     * Whichever accepts a sender first is used to receive the encrypted stream.
-     */
-    public static Path receiveAnyNetwork(
+    public static List<Path> receiveFilesAnyNetwork(
             ServerSocket server,
             String code,
             Path directory,
@@ -233,7 +252,6 @@ public final class TransferService {
 
         CompletableFuture<Socket> winningSocket = new CompletableFuture<>();
 
-        // 1. Direct LAN / Local listener
         Thread directThread = new Thread(() -> {
             try {
                 Socket s = server.accept();
@@ -248,7 +266,6 @@ public final class TransferService {
         directThread.setDaemon(true);
         directThread.start();
 
-        // 2. Cross-network Relay listener
         Thread relayThread = new Thread(() -> {
             try {
                 Socket relaySock = connectRelayAsReceiver(code, handle);
@@ -258,7 +275,6 @@ public final class TransferService {
                     try { server.close(); } catch (IOException ignored) {}
                 }
             } catch (IOException ignored) {
-                // Relay optional if LAN succeeds
             }
         }, "filzadrop-relay-accept");
         relayThread.setDaemon(true);
@@ -274,61 +290,121 @@ public final class TransferService {
             throw e;
         }
 
-        return receiveFromSocket(socket, code, directory, handle, progress);
+        return receiveFilesFromSocket(socket, code, directory, handle, progress);
     }
 
-    private static Path receiveFromSocket(
+    static List<Path> receiveFilesFromSocket(
             Socket socket,
             String code,
             Path directory,
             TransferHandle handle,
             BiConsumer<Long, Long> progress
     ) throws Exception {
+        Files.createDirectories(directory);
+        List<Path> savedFiles = new ArrayList<>();
         try (socket) {
             socket.setSoTimeout(120_000);
             socket.setTcpNoDelay(true);
             InputStream raw = socket.getInputStream();
             byte[] salt = readExactly(raw, SALT), nonce = readExactly(raw, NONCE);
             Cipher cipher = cipher(Cipher.DECRYPT_MODE, code, salt, nonce);
-            Path temp = null;
-            boolean committed = false;
+
             try (DataInputStream in = new DataInputStream(new CipherInputStream(raw, cipher))) {
-                String name = safeName(in.readUTF());
-                long size = in.readLong();
-                if (size < 0 || size > MAX_BYTES) throw new IOException("Invalid file size; maximum is 10 GiB.");
-                temp = Files.createTempFile(directory, ".filzadrop-", ".part");
-                try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(temp))) {
-                    byte[] buf = new byte[BUFFER];
-                    long got = 0;
-                    while (got < size) {
-                        if (handle.isCancelled()) {
-                            throw new CancellationException("Receive cancelled.");
-                        }
-                        int n = in.read(buf, 0, (int) Math.min(buf.length, size - got));
-                        if (n < 0) throw new EOFException("Connection ended before the full file arrived.");
-                        out.write(buf, 0, n);
-                        got += n;
-                        progress.accept(got, size);
+                String firstToken = in.readUTF();
+                if (MULTI_HEADER_MAGIC.equals(firstToken)) {
+                    int fileCount = in.readInt();
+                    long totalBytes = in.readLong();
+                    if (fileCount < 1 || fileCount > 500 || totalBytes < 0 || totalBytes > MAX_BYTES) {
+                        throw new IOException("Invalid multi-file header.");
                     }
+                    long totalGot = 0;
+                    for (int i = 0; i < fileCount; i++) {
+                        String rawName = in.readUTF();
+                        long fileSize = in.readLong();
+                        Path saved = receiveSingleStreamedFile(in, directory, rawName, fileSize, true, handle, gotInFile -> {
+                            progress.accept( gotInFile, totalBytes);
+                        }, totalGot);
+                        totalGot += fileSize;
+                        savedFiles.add(saved);
+                    }
+                } else {
+                    // Backward-compatible single file protocol (used by Android v1)
+                    long fileSize = in.readLong();
+                    Path saved = receiveSingleStreamedFile(in, directory, firstToken, fileSize, false, handle, got -> {
+                        progress.accept(got, fileSize);
+                    }, 0L);
+                    savedFiles.add(saved);
                 }
-                if (in.read() != -1) throw new IOException("Unexpected extra data after file payload.");
-                Path target = uniquePath(directory, name);
-                try {
-                    Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);
-                } catch (AtomicMoveNotSupportedException e) {
-                    Files.move(temp, target);
+                if (in.read() != -1) {
+                    throw new IOException("Unexpected trailing data after payload.");
                 }
-                committed = true;
-                return target;
+                return savedFiles;
             } catch (Exception e) {
+                for (Path p : savedFiles) {
+                    try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                }
                 if (handle.isCancelled()) {
                     throw new CancellationException("Receive cancelled.");
                 }
-                throw new IOException("Transfer rejected or interrupted. Check pairing code.", e);
-            } finally {
-                if (!committed && temp != null) {
-                    try { Files.deleteIfExists(temp); } catch (IOException ignored) {}
+                throw new IOException("Transfer rejected or interrupted: " + e.getMessage(), e);
+            }
+        }
+    }
+
+    private static Path receiveSingleStreamedFile(
+            DataInputStream in,
+            Path directory,
+            String rawName,
+            long size,
+            boolean expectSha256,
+            TransferHandle handle,
+             java.util.function.LongConsumer totalProgress,
+            long baseOffset
+    ) throws Exception {
+        String name = safeName(rawName);
+        if (size < 0 || size > MAX_BYTES) {
+            throw new IOException("Invalid file size; maximum is 10 GiB.");
+        }
+        Path temp = Files.createTempFile(directory, ".filzadrop-", ".part");
+        boolean committed = false;
+        try {
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(temp))) {
+                byte[] buf = new byte[BUFFER];
+                long got = 0;
+                while (got < size) {
+                    if (handle.isCancelled()) {
+                        throw new CancellationException("Receive cancelled.");
+                    }
+                    int n = in.read(buf, 0, (int) Math.min(buf.length, size - got));
+                    if (n < 0) {
+                        throw new EOFException("Connection ended before full file arrived.");
+                    }
+                    out.write(buf, 0, n);
+                    sha256.update(buf, 0, n);
+                    got += n;
+                    totalProgress.accept(baseOffset + got);
                 }
+            }
+            if (expectSha256) {
+                byte[] expectedHash = new byte[32];
+                in.readFully(expectedHash);
+                byte[] actualHash = sha256.digest();
+                if (!MessageDigest.isEqual(expectedHash, actualHash)) {
+                    throw new IOException("SHA-256 integrity check failed for " + name);
+                }
+            }
+            Path target = uniquePath(directory, name);
+            try {
+                Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temp, target);
+            }
+            committed = true;
+            return target;
+        } finally {
+            if (!committed) {
+                try { Files.deleteIfExists(temp); } catch (IOException ignored) {}
             }
         }
     }
@@ -413,7 +489,7 @@ public final class TransferService {
         return b;
     }
 
-    static String safeName(String name) throws IOException {
+    public static String safeName(String name) throws IOException {
         if (name == null || name.isBlank()) throw new IOException("Empty filename.");
         String n = name.replace('\\', '/');
         n = n.substring(n.lastIndexOf('/') + 1);
@@ -423,7 +499,7 @@ public final class TransferService {
         return n.length() > 180 ? n.substring(0, 180) : n;
     }
 
-    static Path uniquePath(Path dir, String file) throws IOException {
+    public static Path uniquePath(Path dir, String file) throws IOException {
         Path p = dir.resolve(file);
         if (!Files.exists(p)) return p;
         String base = file, ext = "";

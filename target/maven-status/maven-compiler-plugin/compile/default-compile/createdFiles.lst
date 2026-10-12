@@ -1,6 +1,7 @@
 dev\filza\filzadrop\FilzaDropApp.class
 dev\filza\filzadrop\LanDiscoveryService$DiscoveredPeer.class
 dev\filza\filzadrop\LanDiscoveryService.class
+dev\filza\filzadrop\MobileWebBridge$DownloadSession.class
 dev\filza\filzadrop\Launcher.class
 dev\filza\filzadrop\TransferService$CancellationException.class
 dev\filza\filzadrop\FilzaDropApp$2.class
@@ -9,5 +10,6 @@ dev\filza\filzadrop\LanScanner.class
 dev\filza\filzadrop\RelayServer.class
 dev\filza\filzadrop\FilzaDropApp$1.class
 dev\filza\filzadrop\QrGenerator.class
+dev\filza\filzadrop\RelayServer$WaitingSession.class
 dev\filza\filzadrop\MobileWebBridge.class
 dev\filza\filzadrop\TransferService$TransferHandle.class
