@@ -1,56 +1,156 @@
 # FilzaDrop
 
-FilzaDrop is a Java 21 + JavaFX local-network file transfer prototype for Windows. It sends one file directly between two running instances without cloud storage or accounts.
+**Send files without the cloud.**
 
-## Requirements
-- Windows 10/11
+FilzaDrop is a file-sharing application built with Java, designed to make transferring files between devices simple and convenient. The project focuses on a clean desktop experience, local-network file sharing, and exploring cross-platform device connectivity.
+
+## ✨ Features
+
+- **Desktop application:** A JavaFX-based Windows interface.
+- **Local file sharing:** Transfer files between compatible devices on a network.
+- **Modern UI:** A minimalist interface with a deep-purple theme.
+- **Transfer management:** Designed to support transfer progress and cancellation.
+- **Device discovery:** Discover compatible devices on the local network.
+- **Mobile connectivity:** Includes Android application source code and a browser-based mobile bridge.
+- **Java runtime bundled:** The packaged Windows build includes its own Java runtime.
+- **Open source:** Explore the code, report issues, and contribute improvements.
+
+> Feature availability depends on the current implementation and configuration. Test mobile connectivity, transfer cancellation, and cross-network transfers before relying on them.
+
+## 🖥️ Download for Windows
+
+Visit the [FilzaDrop Releases page](https://github.com/Peshimam-Ashar-Mohammed/FilzaDrop/releases).
+
+If a Windows ZIP release is available:
+
+1. Download `FilzaDrop-Windows-1.0.0.zip`.
+2. Extract the ZIP file.
+3. Open the extracted `FilzaDrop` folder.
+4. Run `FilzaDrop.exe`.
+5. Allow network access through Windows Firewall when appropriate for your network.
+
+**Important:** Keep the `app` and `runtime` folders alongside `FilzaDrop.exe`. Do not move the executable out of its application folder.
+
+If no release is published yet, see the build instructions below.
+
+## 🛠️ Built With
+
+- Java 21
+- JavaFX
+- Maven
+- Kotlin and Jetpack Compose for the Android project
+- TCP/IP networking
+- Git and GitHub
+
+## 🚀 Run from Source
+
+### Prerequisites
+
 - JDK 21
-- Maven 3.9+
+- Maven
+- Git
 
-## Run
-Open this folder in VS Code, open Terminal in the folder containing `pom.xml`, and run:
+### 1. Clone the repository
 
-```powershell
-java -version
-mvn -version
-mvn clean javafx:run
+```bash
+git clone https://github.com/Peshimam-Ashar-Mohammed/FilzaDrop.git
+cd FilzaDrop
 ```
 
-## Test on two Windows PCs
-1. Connect both PCs to the same trusted private Wi-Fi/LAN. Guest networks may block device-to-device traffic.
-2. Run `mvn javafx:run` on both PCs.
-3. On the receiving PC, click **Start receiving**. Note the displayed IPv4 address and one-time 8-digit pairing code.
-4. If Windows Firewall prompts, allow Java on **Private networks only**. Do not enable public-network access or configure router port forwarding.
-5. On the sending PC, choose a file, enter the receiver's local IP and code, and click **Send securely**.
-6. The received file is saved to `%USERPROFILE%\Downloads\FilzaDrop`.
-7. Verify both copies with `Get-FileHash "C:\path\to\file" -Algorithm SHA256` in PowerShell.
+### 2. Build the desktop application
 
-## Phase 1 features
-- Dark purple JavaFX interface branded **FilzaDrop by Filza**
-- File picker and drag-and-drop
-- One-shot receiver and 8-digit pairing code
-- AES-256-GCM authenticated encryption, key derived with PBKDF2-HMAC-SHA-256
-- Random per-transfer salt and nonce
-- Streaming I/O; files are not loaded wholly into memory
-- Temporary receive file; final filename is published only after authentication succeeds
-- Filename sanitization, collision-safe names, 10 GiB limit
+```bash
+mvn clean package
+```
 
-## Limitations and security notes
-- This is an early prototype, not an independently audited security product.
-- Manual IP entry is used; automatic discovery is planned for a later phase.
-- A receiver accepts one connection/file per session. Restart receiving for another transfer.
-- The one-time code is a shared secret. Only share it with the intended sender.
-- Both devices must be able to reach one another on the LAN. Wi-Fi client isolation, firewall settings, or VPN software can block it.
-- No router port forwarding is required. Do not expose this prototype to the public internet.
+### 3. Run the application
 
-## Structure
+```bash
+java -jar target/filzadrop-1.0.0.jar
+```
+
+## 📦 Package for Windows
+
+On Windows, after successfully building the project, run:
+
+```bat
+mkdir target\release-input
+copy target\filzadrop-1.0.0.jar target\release-input\
+jpackage --type app-image --name FilzaDrop --app-version 1.0.0 --input target\release-input --main-jar filzadrop-1.0.0.jar --main-class dev.filza.filzadrop.Launcher --dest dist
+```
+
+The packaged application will be generated in:
+
 ```text
-FilzaDrop/
-├── pom.xml
-├── README.md
-├── LICENSE
-└── src/main/
-    ├── java/dev/filza/filzadrop/FilzaDropApp.java
-    ├── java/dev/filza/filzadrop/TransferService.java
-    └── resources/styles.css
+dist/
+└── FilzaDrop/
+    ├── FilzaDrop.exe
+    ├── app/
+    └── runtime/
 ```
+
+To launch it:
+
+```bat
+dist\FilzaDrop\FilzaDrop.exe
+```
+
+To distribute it, ZIP the **contents of the complete `dist\FilzaDrop` directory**, not just the executable.
+
+## 📱 Android
+
+The repository contains Android project source code.
+
+To build an Android APK, open the appropriate Android project directory in Android Studio, allow Gradle to synchronize, and build the APK using **Build → Build APK(s)**.
+
+The Android build and device-to-device compatibility should be tested before publishing an APK.
+
+## 🌐 Network Requirements
+
+- For local-network transfers, connect the participating devices to a network that permits communication between them.
+- Windows Firewall or router settings may block incoming connections.
+- Cross-network transfers require a reachable relay or another supported connectivity configuration; a relay running only on `localhost` cannot connect remote devices over the internet.
+- Use only trusted networks and transfer files to devices you recognize.
+
+## 🔐 Security
+
+Security is an ongoing part of FilzaDrop's development.
+
+Before using FilzaDrop for sensitive files, verify the current implementation of encryption, device pairing, file validation, and mobile uploads. Do not expose an unreviewed relay or mobile upload service directly to the public internet.
+
+## 🗺️ Roadmap
+
+- [ ] Reliable Windows-to-Windows transfers
+- [ ] Tested Android integration
+- [ ] Improved device discovery and duplicate filtering
+- [ ] Clear transfer progress and cancellation
+- [ ] Secure pairing and mobile upload validation
+- [ ] Simplified installation and release packaging
+- [ ] Improved cross-network connectivity
+- [ ] Automated builds and release testing
+
+## 🤝 Contributing
+
+Contributions, bug reports, and feature suggestions are welcome.
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Make and test your changes.
+4. Submit a pull request describing the changes.
+
+For bugs, include your operating system, Java version, steps to reproduce the issue, and relevant error logs. Do not include passwords, private keys, or sensitive files.
+
+## 📄 License
+
+Check the repository's license file for the applicable license and usage terms.
+
+## 👨‍💻 Author
+
+**Ashar**
+
+- GitHub: [Peshimam-Ashar-Mohammed](https://github.com/Peshimam-Ashar-Mohammed)
+- Project: [FilzaDrop](https://github.com/Peshimam-Ashar-Mohammed/FilzaDrop)
+
+---
+
+*FilzaDrop — Send files without the cloud.*
