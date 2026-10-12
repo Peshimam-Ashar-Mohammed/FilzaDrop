@@ -14,11 +14,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
-/**
- * Built-in Mobile/Android Web Bridge on port 45824.
- * Allows any Android phone (or tablet) to send/receive files with Windows or another Android phone
- * using only the 6-digit pairing code — either via the Native Android app or any mobile browser.
- */
 public final class MobileWebBridge implements AutoCloseable {
     public static final int WEB_PORT = 45824;
 
@@ -39,6 +34,12 @@ public final class MobileWebBridge implements AutoCloseable {
         if (code != null && file != null) {
             sharedFilesByCode.put(code.trim(), file);
         }
+    }
+
+    public String getMobileUrl(String code) {
+        String base = "http://" + TransferService.getLocalIpv4Hint() + ":" + WEB_PORT;
+        String digits = code == null ? "" : code.replaceAll("\\D", "");
+        return digits.isEmpty() ? base : base + "/?code=" + digits;
     }
 
     public void start() {
@@ -78,42 +79,74 @@ public final class MobileWebBridge implements AutoCloseable {
                   input[type="file"] { width: 100%; color: #A594C8; font-size: 12px; margin-bottom: 12px; }
                   button { width: 100%; background: #6D28D9; border: none; border-radius: 8px; padding: 11px; color: #fff; font-weight: 600; font-size: 12px; cursor: pointer; }
                   button:hover { background: #7C3AED; }
-                  .status { font-size: 11px; color: #8E7FB0; margin-top: 8px; }
+                  .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(6, 4, 10, 0.78); align-items: center; justify-content: center; padding: 20px; }
+                  .modal { width: 100%; max-width: 320px; background: #130E1E; border: 1px solid #32244F; border-radius: 12px; padding: 18px; }
+                  .modal-title { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+                  .modal-body { font-size: 12px; color: #A594C8; margin-bottom: 14px; word-break: break-all; }
                 </style>
                 </head>
                 <body>
                   <div class="container">
                     <h1>FilzaDrop</h1>
                     <div class="pane">
-                      <div class="pane-title">Send</div>
-                      <div class="pane-sub">Select a file and enter the 6-digit code</div>
+                      <div class="pane-title">Send to PC</div>
+                      <div class="pane-sub">Select a file and confirm the 6-digit code</div>
                       <input type="file" id="fileInput" />
                       <input type="text" id="sendCode" maxlength="6" placeholder="6-digit code" />
                       <button onclick="sendFile()">Send</button>
                     </div>
                     <div class="pane">
-                      <div class="pane-title">Receive</div>
+                      <div class="pane-title">Receive from PC</div>
                       <div class="pane-sub">Enter sender's 6-digit code to download</div>
                       <input type="text" id="recvCode" maxlength="6" placeholder="6-digit code" />
                       <button onclick="downloadFile()">Receive</button>
                     </div>
-                    <div class="status" id="status">Ready</div>
+                  </div>
+                  <div class="modal-backdrop" id="modalBackdrop">
+                    <div class="modal">
+                      <div class="modal-title" id="modalTitle"></div>
+                      <div class="modal-body" id="modalBody"></div>
+                      <button onclick="closeModal()">Dismiss</button>
+                    </div>
                   </div>
                   <script>
+                    const params = new URLSearchParams(window.location.search);
+                    const urlCode = params.get('code') || '';
+                    if (urlCode) {
+                      document.getElementById('sendCode').value = urlCode;
+                      document.getElementById('recvCode').value = urlCode;
+                    }
+                    function showModal(title, body) {
+                      document.getElementById('modalTitle').innerText = title;
+                      document.getElementById('modalBody').innerText = body;
+                      document.getElementById('modalBackdrop').style.display = 'flex';
+                    }
+                    function closeModal() {
+                      document.getElementById('modalBackdrop').style.display = 'none';
+                    }
                     async function sendFile() {
                       const code = document.getElementById('sendCode').value.trim();
                       const file = document.getElementById('fileInput').files[0];
-                      const status = document.getElementById('status');
-                      if (!code || !file) { status.innerText = 'Select a file and enter the 6-digit code'; return; }
-                      status.innerText = 'Sending ' + file.name + '...';
-                      const res = await fetch('/upload?code=' + encodeURIComponent(code) + '&name=' + encodeURIComponent(file.name), {
-                        method: 'POST', body: file
-                      });
-                      status.innerText = await res.text();
+                      if (!code || !file) {
+                        showModal('Missing Details', 'Select a file and enter the 6-digit pairing code.');
+                        return;
+                      }
+                      try {
+                        const res = await fetch('/upload?code=' + encodeURIComponent(code) + '&name=' + encodeURIComponent(file.name), {
+                          method: 'POST', body: file
+                        });
+                        const text = await res.text();
+                        showModal(res.ok ? 'Transfer Complete' : 'Transfer Failed', text);
+                      } catch (e) {
+                        showModal('Transfer Failed', 'Could not reach PC.');
+                      }
                     }
                     function downloadFile() {
                       const code = document.getElementById('recvCode').value.trim();
-                      if (!code) return;
+                      if (!code) {
+                        showModal('Missing Code', 'Enter the 6-digit pairing code.');
+                        return;
+                      }
                       window.location.href = '/download?code=' + encodeURIComponent(code);
                     }
                   </script>
@@ -148,7 +181,7 @@ public final class MobileWebBridge implements AutoCloseable {
         if (onFileReceivedFromAndroid != null) {
             onFileReceivedFromAndroid.accept(target);
         }
-        respondText(ex, 200, "Delivered to PC: " + target.getFileName());
+        respondText(ex, 200, "Saved to PC: " + target.getFileName());
     }
 
     private void handleDownload(HttpExchange ex) throws IOException {

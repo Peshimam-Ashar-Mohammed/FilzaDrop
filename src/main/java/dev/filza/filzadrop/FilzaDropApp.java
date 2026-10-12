@@ -16,13 +16,12 @@ import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
-import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.TextField;
-import javafx.scene.control.TextInputDialog;
+import javafx.scene.image.ImageView;
 import javafx.scene.input.Clipboard;
 import javafx.scene.input.ClipboardContent;
 import javafx.scene.input.TransferMode;
@@ -31,8 +30,11 @@ import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
+import javafx.scene.paint.Color;
 import javafx.stage.FileChooser;
+import javafx.stage.Modality;
 import javafx.stage.Stage;
+import javafx.stage.StageStyle;
 
 public class FilzaDropApp extends Application {
     private static final String EMPTY_CODE = "— — — — — —";
@@ -40,6 +42,8 @@ public class FilzaDropApp extends Application {
     private Stage stage;
     private Label status;
     private Label pairingCode;
+    private ImageView receiveQrView;
+    private VBox qrContainer;
     private Label fileLabel;
     private Label fileMetaLabel;
     private Label progressText;
@@ -73,14 +77,14 @@ public class FilzaDropApp extends Application {
         scrollPane.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
         scrollPane.getStyleClass().add("main-scroll");
 
-        Scene scene = new Scene(scrollPane, 760, 540);
+        Scene scene = new Scene(scrollPane, 800, 560);
         scene.getStylesheets().add(
                 getClass().getResource("/styles.css").toExternalForm()
         );
 
         stage.setTitle("FilzaDrop");
-        stage.setMinWidth(580);
-        stage.setMinHeight(460);
+        stage.setMinWidth(600);
+        stage.setMinHeight(480);
         stage.setScene(scene);
         stage.show();
     }
@@ -97,6 +101,13 @@ public class FilzaDropApp extends Application {
             progress.setProgress(1);
             progressText.setText("Saved " + receivedPath.getFileName());
             setStatus("Received from Android");
+            showTransferResultDialog(
+                    true,
+                    "Transfer Complete",
+                    "Received file from phone and saved to:\n" + receivedPath,
+                    receivedPath,
+                    null
+            );
         }));
         mobileWebBridge.start();
 
@@ -130,19 +141,15 @@ public class FilzaDropApp extends Application {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
-        String mobileUrl = "http://" + TransferService.getLocalIpv4Hint() + ":" + MobileWebBridge.WEB_PORT;
-        Button androidLinkBtn = new Button("Android Link");
-        androidLinkBtn.getStyleClass().add("ghost-button");
-        androidLinkBtn.setOnAction(e -> {
-            copyToClipboard(mobileUrl);
-            setStatus("Copied Android web link: " + mobileUrl);
-        });
+        Button qrModalBtn = new Button("Phone QR");
+        qrModalBtn.getStyleClass().add("ghost-button");
+        qrModalBtn.setOnAction(e -> showPhoneQrDialog());
 
         Button relayBtn = new Button("Relay");
         relayBtn.getStyleClass().add("ghost-button");
-        relayBtn.setOnAction(e -> configureRelayDialog());
+        relayBtn.setOnAction(e -> showRelayDialog());
 
-        HBox topBar = new HBox(8, brand, spacer, androidLinkBtn, relayBtn);
+        HBox topBar = new HBox(8, brand, spacer, qrModalBtn, relayBtn);
         topBar.setAlignment(Pos.CENTER_LEFT);
         return topBar;
     }
@@ -167,7 +174,7 @@ public class FilzaDropApp extends Application {
 
         VBox dropZone = new VBox(4, fileLabel, fileMetaLabel);
         dropZone.setAlignment(Pos.CENTER);
-        dropZone.setMinHeight(96);
+        dropZone.setMinHeight(104);
         dropZone.setMaxWidth(Double.MAX_VALUE);
         dropZone.getStyleClass().add("drop-zone");
         VBox.setVgrow(dropZone, Priority.ALWAYS);
@@ -197,13 +204,13 @@ public class FilzaDropApp extends Application {
 
     private VBox createReceivePane() {
         Label header = styledLabel("Receive", "pane-title");
-        Label sub = styledLabel("Share this one-time code with the sender", "pane-sub");
+        Label sub = styledLabel("Share the 6-digit code or scan QR with your phone", "pane-sub");
 
         pairingCode = styledLabel(EMPTY_CODE, "code-box");
         pairingCode.setMaxWidth(Double.MAX_VALUE);
-        pairingCode.setMinHeight(96);
+        pairingCode.setMinHeight(104);
         pairingCode.setAlignment(Pos.CENTER);
-        VBox.setVgrow(pairingCode, Priority.ALWAYS);
+        HBox.setHgrow(pairingCode, Priority.ALWAYS);
         pairingCode.setOnMouseClicked(e -> {
             String code = pairingCode.getText().replaceAll("\\D", "");
             if (!code.isEmpty()) {
@@ -211,6 +218,22 @@ public class FilzaDropApp extends Application {
                 setStatus("Copied code " + code);
             }
         });
+
+        receiveQrView = new ImageView();
+        receiveQrView.setFitWidth(96);
+        receiveQrView.setFitHeight(96);
+        receiveQrView.setPreserveRatio(true);
+
+        qrContainer = new VBox(receiveQrView);
+        qrContainer.setAlignment(Pos.CENTER);
+        qrContainer.getStyleClass().add("qr-box");
+        qrContainer.setVisible(false);
+        qrContainer.setManaged(false);
+        qrContainer.setOnMouseClicked(e -> showPhoneQrDialog());
+
+        HBox codeAndQrRow = new HBox(10, pairingCode, qrContainer);
+        codeAndQrRow.setAlignment(Pos.CENTER);
+        VBox.setVgrow(codeAndQrRow, Priority.ALWAYS);
 
         Label saveHint = styledLabel("Saves to Downloads/FilzaDrop · Click code to copy", "pane-sub");
 
@@ -224,7 +247,7 @@ public class FilzaDropApp extends Application {
         cancelReceiveButton.setVisible(false);
         cancelReceiveButton.setManaged(false);
 
-        VBox pane = new VBox(12, header, sub, pairingCode, saveHint, receiveButton, cancelReceiveButton);
+        VBox pane = new VBox(12, header, sub, codeAndQrRow, saveHint, receiveButton, cancelReceiveButton);
         pane.getStyleClass().add("pane");
         pane.setPadding(new Insets(18));
         return pane;
@@ -320,6 +343,10 @@ public class FilzaDropApp extends Application {
             }
             if (mobileWebBridge != null) {
                 mobileWebBridge.setActiveReceiveCode(code);
+                String qrUrl = mobileWebBridge.getMobileUrl(code);
+                receiveQrView.setImage(QrGenerator.generate(qrUrl, 160));
+                qrContainer.setVisible(true);
+                qrContainer.setManaged(true);
             }
 
             setTransferMode(true, true);
@@ -346,6 +373,13 @@ public class FilzaDropApp extends Application {
                 progress.setProgress(1);
                 progressText.setText(receivedFile.getFileName().toString());
                 setStatus("Saved to " + receivedFile);
+                showTransferResultDialog(
+                        true,
+                        "Transfer Complete",
+                        "Verified and saved:\n" + receivedFile.getFileName() + "\n\nLocation: " + receivedFile.getParent(),
+                        receivedFile,
+                        null
+                );
             });
 
             task.setOnFailed(event -> {
@@ -355,12 +389,30 @@ public class FilzaDropApp extends Application {
                 finishTransfer();
                 progress.setProgress(0);
                 progressText.setText("");
-                setStatus(wasCancelled ? "Receive cancelled" : "Receive failed: " + message(ex));
+                if (wasCancelled) {
+                    setStatus("Receive cancelled");
+                } else {
+                    setStatus("Receive failed");
+                    showTransferResultDialog(
+                            false,
+                            "Transfer Failed",
+                            message(ex) + "\n\nMake sure the sender entered the matching 6-digit pairing code.",
+                            null,
+                            this::startReceiving
+                    );
+                }
             });
 
             startTask(task, "filzadrop-receiver");
         } catch (IOException ex) {
             setStatus("Port busy: " + ex.getMessage());
+            showTransferResultDialog(
+                    false,
+                    "Receiver Unavailable",
+                    "Port " + TransferService.PORT + " is already in use.\n" + ex.getMessage(),
+                    null,
+                    null
+            );
         }
     }
 
@@ -409,6 +461,13 @@ public class FilzaDropApp extends Application {
             progress.setProgress(1);
             progressText.setText("100%");
             setStatus("Sent " + file.getFileName());
+            showTransferResultDialog(
+                    true,
+                    "Transfer Complete",
+                    "Delivered encrypted file:\n" + file.getFileName() + " (" + fileMetaLabel.getText().replace(" · Click to change", "") + ")",
+                    null,
+                    null
+            );
         });
 
         task.setOnFailed(event -> {
@@ -418,10 +477,190 @@ public class FilzaDropApp extends Application {
             finishTransfer();
             progress.setProgress(0);
             progressText.setText("");
-            setStatus(wasCancelled ? "Send cancelled" : "Send failed: " + message(ex));
+            if (wasCancelled) {
+                setStatus("Send cancelled");
+            } else {
+                setStatus("Send failed");
+                showTransferResultDialog(
+                        false,
+                        "Transfer Failed",
+                        message(ex) + "\n\nEnsure the receiving device is listening with code " + code + ".",
+                        null,
+                        this::sendFile
+                );
+            }
         });
 
         startTask(task, "filzadrop-sender");
+    }
+
+    private void showTransferResultDialog(
+            boolean success,
+            String title,
+            String detail,
+            Path savedFile,
+            Runnable onRetry
+    ) {
+        Stage dialog = new Stage(StageStyle.TRANSPARENT);
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.APPLICATION_MODAL);
+
+        Label badge = styledLabel(success ? "COMPLETED" : "ERROR", success ? "dialog-badge-ok" : "dialog-badge-err");
+        Label heading = styledLabel(title, "dialog-title");
+        Label body = styledLabel(detail, "dialog-body");
+        body.setWrapText(true);
+
+        HBox actions = new HBox(10);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        if (savedFile != null) {
+            Button openFolderBtn = new Button("Open Folder");
+            openFolderBtn.getStyleClass().add("ghost-button");
+            openFolderBtn.setOnAction(e -> {
+                try {
+                    new ProcessBuilder("explorer.exe", "/select," + savedFile.toAbsolutePath()).start();
+                } catch (IOException ignored) {}
+                dialog.close();
+            });
+            actions.getChildren().add(openFolderBtn);
+        }
+
+        if (!success && onRetry != null) {
+            Button retryBtn = new Button("Try Again");
+            retryBtn.getStyleClass().add("primary-btn");
+            retryBtn.setOnAction(e -> {
+                dialog.close();
+                onRetry.run();
+            });
+            actions.getChildren().add(retryBtn);
+        }
+
+        Button closeBtn = new Button(success ? "Done" : "Dismiss");
+        closeBtn.getStyleClass().add(success ? "primary-btn" : "ghost-button");
+        closeBtn.setOnAction(e -> dialog.close());
+        actions.getChildren().add(closeBtn);
+
+        VBox card = new VBox(14, badge, heading, body, actions);
+        card.setPadding(new Insets(22));
+        card.setPrefWidth(380);
+        card.getStyleClass().add(success ? "dialog-card-ok" : "dialog-card-err");
+
+        Scene scene = new Scene(card);
+        scene.setFill(Color.TRANSPARENT);
+        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        dialog.setScene(scene);
+        dialog.showAndWait();
+    }
+
+    private void showPhoneQrDialog() {
+        String activeCode = pairingCode.getText().replaceAll("\\D", "");
+        if (activeCode.isEmpty() && !codeField.getText().isBlank()) {
+            activeCode = codeField.getText().replaceAll("\\D", "");
+        }
+        if (activeCode.isEmpty() && chosenFile != null) {
+            activeCode = TransferService.newCode();
+            codeField.setText(activeCode);
+            if (mobileWebBridge != null) {
+                mobileWebBridge.registerOutgoingFile(activeCode, chosenFile);
+            }
+        }
+
+        String url = mobileWebBridge != null
+                ? mobileWebBridge.getMobileUrl(activeCode)
+                : "http://" + TransferService.getLocalIpv4Hint() + ":" + MobileWebBridge.WEB_PORT;
+
+        Stage dialog = new Stage(StageStyle.TRANSPARENT);
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.APPLICATION_MODAL);
+
+        Label heading = styledLabel("Scan with Android Phone", "dialog-title");
+        Label sub = styledLabel(
+                activeCode.isEmpty()
+                        ? "Scan to open FilzaDrop on your phone"
+                        : "Paired with code " + activeCode + " · Open camera to scan",
+                "dialog-body"
+        );
+
+        ImageView qr = new ImageView(QrGenerator.generate(url, 200));
+        VBox qrWrap = new VBox(qr);
+        qrWrap.setAlignment(Pos.CENTER);
+        qrWrap.getStyleClass().add("qr-box");
+        qrWrap.setPadding(new Insets(12));
+
+        Label urlLabel = styledLabel(url, "pane-sub");
+
+        Button copyBtn = new Button("Copy Link");
+        copyBtn.getStyleClass().add("ghost-button");
+        copyBtn.setOnAction(e -> {
+            copyToClipboard(url);
+            setStatus("Copied link: " + url);
+        });
+
+        Button closeBtn = new Button("Close");
+        closeBtn.getStyleClass().add("primary-btn");
+        closeBtn.setOnAction(e -> dialog.close());
+
+        HBox actions = new HBox(10, copyBtn, closeBtn);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        VBox card = new VBox(14, heading, sub, qrWrap, urlLabel, actions);
+        card.setAlignment(Pos.CENTER);
+        card.setPadding(new Insets(22));
+        card.setPrefWidth(340);
+        card.getStyleClass().add("dialog-card-ok");
+
+        Scene scene = new Scene(card);
+        scene.setFill(Color.TRANSPARENT);
+        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        dialog.setScene(scene);
+        dialog.showAndWait();
+    }
+
+    private void showRelayDialog() {
+        Stage dialog = new Stage(StageStyle.TRANSPARENT);
+        dialog.initOwner(stage);
+        dialog.initModality(Modality.APPLICATION_MODAL);
+
+        Label heading = styledLabel("Cross-Network Relay", "dialog-title");
+        Label sub = styledLabel("Set relay server address (host:port) for transfers across different networks.", "dialog-body");
+        sub.setWrapText(true);
+
+        TextField input = new TextField(TransferService.getRelayEndpoint());
+        input.getStyleClass().add("code-input");
+
+        Button cancelBtn = new Button("Cancel");
+        cancelBtn.getStyleClass().add("ghost-button");
+        cancelBtn.setOnAction(e -> dialog.close());
+
+        Button saveBtn = new Button("Save");
+        saveBtn.getStyleClass().add("primary-btn");
+        saveBtn.setOnAction(e -> {
+            String trimmed = input.getText().trim();
+            int colon = trimmed.lastIndexOf(':');
+            if (colon > 0) {
+                try {
+                    String h = trimmed.substring(0, colon).trim();
+                    int p = Integer.parseInt(trimmed.substring(colon + 1).trim());
+                    TransferService.setRelayEndpoint(h, p);
+                    setStatus("Relay set to " + TransferService.getRelayEndpoint());
+                } catch (NumberFormatException ignored) {}
+            }
+            dialog.close();
+        });
+
+        HBox actions = new HBox(10, cancelBtn, saveBtn);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+
+        VBox card = new VBox(14, heading, sub, input, actions);
+        card.setPadding(new Insets(22));
+        card.setPrefWidth(360);
+        card.getStyleClass().add("dialog-card-ok");
+
+        Scene scene = new Scene(card);
+        scene.setFill(Color.TRANSPARENT);
+        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        dialog.setScene(scene);
+        dialog.showAndWait();
     }
 
     private void cancelActiveTransfer() {
@@ -470,6 +709,10 @@ public class FilzaDropApp extends Application {
         setTransferMode(false, false);
         closeServer();
         pairingCode.setText(EMPTY_CODE);
+        if (qrContainer != null) {
+            qrContainer.setVisible(false);
+            qrContainer.setManaged(false);
+        }
         if (discoveryService != null) {
             discoveryService.setActivePairingCode("");
         }
@@ -483,30 +726,6 @@ public class FilzaDropApp extends Application {
             try { server.close(); } catch (IOException ignored) {}
             server = null;
         }
-    }
-
-    private void configureRelayDialog() {
-        TextInputDialog dialog = new TextInputDialog(TransferService.getRelayEndpoint());
-        dialog.initOwner(stage);
-        dialog.setTitle("Relay Server");
-        dialog.setHeaderText(null);
-        dialog.setContentText("Relay address (host:port):");
-        dialog.getDialogPane().getStylesheets().add(
-                getClass().getResource("/styles.css").toExternalForm()
-        );
-        Optional<String> res = dialog.showAndWait();
-        res.ifPresent(val -> {
-            String trimmed = val.trim();
-            int colon = trimmed.lastIndexOf(':');
-            if (colon > 0) {
-                try {
-                    String h = trimmed.substring(0, colon).trim();
-                    int p = Integer.parseInt(trimmed.substring(colon + 1).trim());
-                    TransferService.setRelayEndpoint(h, p);
-                    setStatus("Relay set to " + TransferService.getRelayEndpoint());
-                } catch (NumberFormatException ignored) {}
-            }
-        });
     }
 
     private void chooseFile() {
@@ -564,7 +783,7 @@ public class FilzaDropApp extends Application {
 
     private String message(Throwable exception) {
         if (exception == null || exception.getMessage() == null) {
-            return "Disconnected";
+            return "Connection interrupted.";
         }
         return exception.getMessage().toLowerCase(Locale.ROOT).contains("cancelled")
                 ? "Cancelled"

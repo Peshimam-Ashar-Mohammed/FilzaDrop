@@ -1,6 +1,7 @@
 package dev.filza.filzadrop.android
 
 import android.content.ContentResolver
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,12 +11,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -24,15 +25,19 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.*
 import java.io.*
 import java.net.*
@@ -61,10 +66,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun FilzaDropAndroidTheme(content: @Composable () -> Unit) {
     val colorScheme = darkColorScheme(
-        primary = Color(0xFFA855F7),
-        secondary = Color(0xFF6D28D9),
-        background = Color(0xFF0B0714),
-        surface = Color(0xFF160E29)
+        primary = Color(0xFF6D28D9),
+        secondary = Color(0xFF7C3AED),
+        background = Color(0xFF0D0A14),
+        surface = Color(0xFF130E1E)
     )
     MaterialTheme(colorScheme = colorScheme, content = content)
 }
@@ -77,23 +82,31 @@ data class PeerDevice(
     val activeCode: String
 )
 
+data class TransferDialogState(
+    val success: Boolean,
+    val title: String,
+    val detail: String
+)
+
 @Composable
 fun FilzaDropScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
 
-    var activeCode by remember { mutableStateOf("• • • • • •") }
+    var activeCode by remember { mutableStateOf("— — — — — —") }
+    var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var inputCode by remember { mutableStateOf("") }
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var selectedFileName by remember { mutableStateOf("Tap to choose file") }
+    var selectedFileName by remember { mutableStateOf("Tap to select a file") }
     var selectedFileSize by remember { mutableStateOf(0L) }
 
     var isReceiving by remember { mutableStateOf(false) }
     var isSending by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
-    var statusText by remember { mutableStateOf("Ready to share with Windows & Android") }
+    var statusText by remember { mutableStateOf("Ready") }
     var relayEndpoint by remember { mutableStateOf("127.0.0.1:45823") }
+    var dialogState by remember { mutableStateOf<TransferDialogState?>(null) }
 
     val peers = remember { mutableStateMapOf<String, PeerDevice>() }
     val codeDirectory = remember { ConcurrentHashMap<String, InetSocketAddress>() }
@@ -101,7 +114,6 @@ fun FilzaDropScreen() {
     var activeJob by remember { mutableStateOf<Job?>(null) }
     var activeServerSocket by remember { mutableStateOf<ServerSocket?>(null) }
 
-    // Background UDP discovery for Android <-> Windows & Android <-> Android
     DisposableEffect(Unit) {
         val discoveryJob = scope.launch(Dispatchers.IO) {
             AndroidProtocol.runDiscoveryLoop(
@@ -133,165 +145,93 @@ fun FilzaDropScreen() {
         activeJob?.cancel()
         isReceiving = false
         isSending = false
-        activeCode = "• • • • • •"
+        activeCode = "— — — — — —"
+        qrBitmap = null
         progress = 0f
-        statusText = "Transfer cancelled."
+        statusText = "Cancelled"
+    }
+
+    // Custom Transfer Complete / Failed Dialog
+    dialogState?.let { dlg ->
+        Dialog(onDismissRequest = { dialogState = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (dlg.success) Color(0xFF130E1E) else Color(0xFF160D18))
+                    .border(
+                        1.dp,
+                        if (dlg.success) Color(0xFF3B2863) else Color(0xFF6E223D),
+                        RoundedCornerShape(12.dp)
+                    )
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = if (dlg.success) "COMPLETED" else "ERROR",
+                    color = if (dlg.success) Color(0xFFC4B5FD) else Color(0xFFFDA4AF),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(dlg.title, color = Color(0xFFF3EEFF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(dlg.detail, color = Color(0xFF9D8EC4), fontSize = 12.sp)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Button(
+                        onClick = { dialogState = null },
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (dlg.success) Color(0xFF6D28D9) else Color(0xFF2A1220)
+                        )
+                    ) {
+                        Text(if (dlg.success) "Done" else "Dismiss", color = Color.White, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF0E081A), Color(0xFF170E2C), Color(0xFF0B0714))
-                )
-            )
+            .background(Color(0xFF0D0A14))
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(scrollState)
-                .padding(22.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // Minimalist Header
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(RoundedCornerShape(13.dp))
-                        .background(Brush.linearGradient(listOf(Color(0xFFA855F7), Color(0xFF6D28D9)))),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("F", color = Color.White, fontWeight = FontWeight.Black, fontSize = 20.sp)
-                }
-                Column {
-                    Text("FilzaDrop", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 20.sp)
-                    Text(
-                        "ANDROID • WINDOWS • ANY NETWORK",
-                        color = Color(0xFF9D88C9),
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
+            Text("FilzaDrop", color = Color(0xFFF3EEFF), fontWeight = FontWeight.Bold, fontSize = 17.sp)
 
-            // RECEIVE CARD
+            // SEND PANE
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(Color(0xFF160F29))
-                    .border(1.dp, Color(0xFF332255), RoundedCornerShape(22.dp))
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF130E1E))
+                    .border(1.dp, Color(0xFF231A36), RoundedCornerShape(10.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("↓  RECEIVE", color = Color(0xFFC084FC), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
-                Text("Receive Files", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0xFF0D0818))
-                        .border(1.dp, Color(0xFF482E7A), RoundedCornerShape(16.dp))
-                        .padding(vertical = 18.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        activeCode,
-                        color = Color(0xFFE9D5FF),
-                        fontSize = 30.sp,
-                        fontWeight = FontWeight.Black,
-                        letterSpacing = 5.sp
-                    )
-                }
-
-                if (!isReceiving) {
-                    Button(
-                        onClick = {
-                            if (isSending) return@Button
-                            val code = String.format("%06d", SecureRandom().nextInt(1_000_000))
-                            activeCode = "${code.substring(0, 3)} ${code.substring(3)}"
-                            isReceiving = true
-                            cancelFlag.set(false)
-                            statusText = "Waiting for sender with code $code…"
-                            activeJob = scope.launch(Dispatchers.IO) {
-                                try {
-                                    val server = ServerSocket(AndroidProtocol.PORT)
-                                    activeServerSocket = server
-                                    val savedFile = AndroidProtocol.receiveFile(
-                                        server = server,
-                                        code = code,
-                                        relayEndpoint = relayEndpoint,
-                                        cancelFlag = cancelFlag
-                                    ) { got, total ->
-                                        progress = if (total > 0) got.toFloat() / total else 0f
-                                    }
-                                    withContext(Dispatchers.Main) {
-                                        isReceiving = false
-                                        activeCode = "• • • • • •"
-                                        progress = 1f
-                                        statusText = "Saved to Downloads: ${savedFile.name}"
-                                    }
-                                } catch (e: Exception) {
-                                    withContext(Dispatchers.Main) {
-                                        if (!cancelFlag.get()) {
-                                            statusText = "Receive failed: ${e.message}"
-                                        }
-                                        isReceiving = false
-                                        activeCode = "• • • • • •"
-                                    }
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(13.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
-                    ) {
-                        Text("Generate Code & Listen", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 6.dp))
-                    }
-                } else {
-                    Button(
-                        onClick = { cancelActive() },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(13.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFBE123C))
-                    ) {
-                        Text("Cancel Receive", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 6.dp))
-                    }
-                }
-            }
-
-            // SEND CARD
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(Color(0xFF160F29))
-                    .border(1.dp, Color(0xFF332255), RoundedCornerShape(22.dp))
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text("↑  SEND", color = Color(0xFFC084FC), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
-                Text("Send Files", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Send", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("Select a file and enter the receiver's 6-digit code", color = Color(0xFF786A96), fontSize = 11.sp)
 
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF100A1E))
-                        .border(1.dp, Color(0xFF483278), RoundedCornerShape(14.dp))
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF0F0B18))
+                        .border(1.dp, Color(0xFF2B2042), RoundedCornerShape(8.dp))
                         .clickable(enabled = !isSending && !isReceiving) { filePicker.launch("*/*") }
-                        .padding(18.dp),
+                        .padding(16.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (selectedUri == null) "Tap to choose file" else "$selectedFileName (${selectedFileSize / 1024} KB)",
-                        color = Color(0xFFC4B5FD),
-                        fontWeight = FontWeight.Bold,
+                        text = if (selectedUri == null) "Tap to select a file" else "$selectedFileName (${selectedFileSize / 1024} KB)",
+                        color = Color(0xFFD5C8F0),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -299,18 +239,18 @@ fun FilzaDropScreen() {
                 OutlinedTextField(
                     value = inputCode,
                     onValueChange = { v -> inputCode = v.filter { it.isDigit() }.take(6) },
-                    placeholder = { Text("Enter 6-digit pairing code", color = Color(0xFF64538A)) },
+                    placeholder = { Text("6-digit code", color = Color(0xFF554870)) },
                     textStyle = TextStyle(
-                        color = Color.White,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        textAlign = TextAlign.Center,
-                        letterSpacing = 4.sp
+                        color = Color(0xFFF3EEFF),
+                        fontSize = 16.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
                     ),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp)
+                    shape = RoundedCornerShape(8.dp)
                 )
 
                 if (!isSending) {
@@ -321,12 +261,12 @@ fun FilzaDropScreen() {
                                 return@Button
                             }
                             if (inputCode.length != 6) {
-                                statusText = "Enter the 6-digit pairing code first."
+                                statusText = "Enter a 6-digit pairing code first"
                                 return@Button
                             }
                             isSending = true
                             cancelFlag.set(false)
-                            statusText = "Connecting to code $inputCode…"
+                            statusText = "Sending $selectedFileName…"
                             activeJob = scope.launch(Dispatchers.IO) {
                                 try {
                                     AndroidProtocol.sendFile(
@@ -344,98 +284,207 @@ fun FilzaDropScreen() {
                                     withContext(Dispatchers.Main) {
                                         isSending = false
                                         progress = 1f
-                                        statusText = "Successfully sent $selectedFileName!"
+                                        statusText = "Sent $selectedFileName"
+                                        dialogState = TransferDialogState(
+                                            true,
+                                            "Transfer Complete",
+                                            "Delivered encrypted file: $selectedFileName"
+                                        )
                                     }
                                 } catch (e: Exception) {
                                     withContext(Dispatchers.Main) {
-                                        if (!cancelFlag.get()) {
-                                            statusText = "Send failed: ${e.message}"
-                                        }
                                         isSending = false
+                                        if (!cancelFlag.get()) {
+                                            statusText = "Send failed"
+                                            dialogState = TransferDialogState(
+                                                false,
+                                                "Transfer Failed",
+                                                e.message ?: "Could not reach receiver with code $inputCode."
+                                            )
+                                        }
                                     }
                                 }
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(13.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
                     ) {
-                        Text("Send Now", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 6.dp))
+                        Text("Send", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
                 } else {
                     Button(
                         onClick = { cancelActive() },
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(13.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFBE123C))
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A1220))
                     ) {
-                        Text("Cancel Send", fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 6.dp))
+                        Text("Cancel", color = Color(0xFFFDA4AF), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
                 }
             }
 
-            // STATUS & PROGRESS
+            // RECEIVE PANE
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xFF130C22))
-                    .border(1.dp, Color(0xFF2A1D47), RoundedCornerShape(18.dp))
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF130E1E))
+                    .border(1.dp, Color(0xFF231A36), RoundedCornerShape(10.dp))
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(statusText, color = Color(0xFFEDE4FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape),
-                    color = Color(0xFFA855F7),
-                    trackColor = Color(0xFF24183D)
-                )
+                Text("Receive", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("Share this 6-digit code or QR with the sender", color = Color(0xFF786A96), fontSize = 11.sp)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(96.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF0F0B18))
+                            .border(1.dp, Color(0xFF2B2042), RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            activeCode,
+                            color = Color(0xFFE9D5FF),
+                            fontSize = 24.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    qrBitmap?.let { bmp ->
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = "QR Code",
+                            modifier = Modifier
+                                .size(96.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .border(1.dp, Color(0xFF2B2042), RoundedCornerShape(8.dp))
+                        )
+                    }
+                }
+
+                if (!isReceiving) {
+                    Button(
+                        onClick = {
+                            if (isSending) return@Button
+                            val code = String.format("%06d", SecureRandom().nextInt(1_000_000))
+                            activeCode = "${code.substring(0, 3)} ${code.substring(3)}"
+                            qrBitmap = AndroidProtocol.generateQrBitmap("filzadrop://pair?code=$code", 240)
+                            isReceiving = true
+                            cancelFlag.set(false)
+                            statusText = "Listening with code $code"
+                            activeJob = scope.launch(Dispatchers.IO) {
+                                try {
+                                    val server = ServerSocket(AndroidProtocol.PORT)
+                                    activeServerSocket = server
+                                    val savedFile = AndroidProtocol.receiveFile(
+                                        server = server,
+                                        code = code,
+                                        cancelFlag = cancelFlag
+                                    ) { got, total ->
+                                        progress = if (total > 0) got.toFloat() / total else 0f
+                                    }
+                                    withContext(Dispatchers.Main) {
+                                        isReceiving = false
+                                        activeCode = "— — — — — —"
+                                        qrBitmap = null
+                                        progress = 1f
+                                        statusText = "Saved ${savedFile.name}"
+                                        dialogState = TransferDialogState(
+                                            true,
+                                            "Transfer Complete",
+                                            "Saved to Downloads:\n${savedFile.absolutePath}"
+                                        )
+                                    }
+                                } catch (e: Exception) {
+                                    withContext(Dispatchers.Main) {
+                                        isReceiving = false
+                                        activeCode = "— — — — — —"
+                                        qrBitmap = null
+                                        if (!cancelFlag.get()) {
+                                            statusText = "Receive failed"
+                                            dialogState = TransferDialogState(
+                                                false,
+                                                "Transfer Failed",
+                                                e.message ?: "Transfer interrupted."
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
+                    ) {
+                        Text("Listen for File", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                    }
+                } else {
+                    Button(
+                        onClick = { cancelActive() },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A1220))
+                    ) {
+                        Text("Cancel", color = Color(0xFFFDA4AF), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                    }
+                }
             }
 
-            // NEARBY DEVICES
+            // DEVICES BAR
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(Color(0xFF130C22))
-                    .border(1.dp, Color(0xFF2A1D47), RoundedCornerShape(18.dp))
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF130E1E))
+                    .border(1.dp, Color(0xFF231A36), RoundedCornerShape(8.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    "NEARBY WINDOWS & ANDROID DEVICES",
-                    color = Color(0xFF9D88C9),
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.ExtraBold
-                )
+                Text("Devices", color = Color(0xFF8E7FB0), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 if (peers.isEmpty()) {
-                    Text("Listening for nearby devices automatically…", color = Color(0xFF8D7CB0), fontSize = 12.sp)
+                    Text("Searching local network…", color = Color(0xFF786A96), fontSize = 11.sp)
                 } else {
                     peers.values.forEach { peer ->
-                        val label = buildString {
-                            append(if (peer.platform.equals("Android", true)) "📱 " else "💻 ")
-                            append(peer.name)
-                            if (peer.activeCode.isNotEmpty()) append("  •  Code: ${peer.activeCode}")
-                        }
+                        val label = "${peer.name} (${peer.platform})" +
+                                if (peer.activeCode.isNotEmpty()) " · ${peer.activeCode}" else ""
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color(0xFF1E1436))
-                                .border(1.dp, Color(0xFF463075), RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color(0xFF1B142B))
+                                .border(1.dp, Color(0xFF32244F), RoundedCornerShape(6.dp))
                                 .clickable {
                                     if (peer.activeCode.isNotEmpty()) {
                                         inputCode = peer.activeCode
-                                        statusText = "Auto-filled code ${peer.activeCode} from ${peer.name}"
+                                        statusText = "Selected code ${peer.activeCode}"
                                     }
                                 }
-                                .padding(12.dp)
+                                .padding(8.dp)
                         ) {
-                            Text(label, color = Color(0xFFE9D5FF), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text(label, color = Color(0xFFD5C8F0), fontSize = 11.sp)
                         }
                     }
                 }
+            }
+
+            // BOTTOM PROGRESS
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(statusText, color = Color(0xFFBFB2D9), fontSize = 11.sp)
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth().height(4.dp),
+                    color = Color(0xFF7C3AED),
+                    trackColor = Color(0xFF1A1329)
+                )
             }
         }
     }
@@ -448,6 +497,19 @@ object AndroidProtocol {
     private const val NONCE = 12
     private const val TAG_BITS = 128
     private const val ITERATIONS = 310_000
+
+    fun generateQrBitmap(content: String, size: Int): Bitmap {
+        val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, size, size)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val fg = android.graphics.Color.parseColor("#F3EEFF")
+        val bg = android.graphics.Color.parseColor("#0F0B18")
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                bmp.setPixel(x, y, if (matrix.get(x, y)) fg else bg)
+            }
+        }
+        return bmp
+    }
 
     fun queryFileMeta(resolver: ContentResolver, uri: Uri): Pair<String, Long> {
         var name = "shared-file"
@@ -568,7 +630,6 @@ object AndroidProtocol {
     fun receiveFile(
         server: ServerSocket,
         code: String,
-        relayEndpoint: String,
         cancelFlag: AtomicBoolean,
         onProgress: (Long, Long) -> Unit
     ): File {
