@@ -408,4 +408,47 @@ class SecurityAndTransferTest {
             assertArrayEquals(binaryPayload, Files.readAllBytes(saved.get(1)));
         }
     }
+
+    // 16. Cross-network (Mobile Data / different Wi-Fi) encrypted tunnel transfer
+    @Test
+    void globalCrossNetworkEncryptedTunnelTransfer(@TempDir Path tempDir) throws Exception {
+        Path srcFile = tempDir.resolve("mobile-data-test.txt");
+        Path dstDir = tempDir.resolve("received");
+        Files.writeString(srcFile, "Transferred across networks over GlobalRelayBridge with AES-256-GCM + SHA-256", StandardCharsets.UTF_8);
+        Files.createDirectories(dstDir);
+
+        String code = TransferService.newCode();
+        try (TransferService.TransferHandle recvHandle = new TransferService.TransferHandle();
+             TransferService.TransferHandle sendHandle = new TransferService.TransferHandle()) {
+
+            CompletableFuture<List<Path>> receiverFuture = CompletableFuture.supplyAsync(() -> {
+                try (GlobalRelayBridge.StreamTunnel recvTunnel =
+                             GlobalRelayBridge.listenAsReceiver(code, "127.0.0.1", 0, recvHandle)) {
+                    return TransferService.receiveFilesFromStream(
+                            recvTunnel.getInputStream(), code, dstDir, recvHandle, (got, total) -> {}
+                    );
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            // Give receiver a moment to subscribe on the TLS rendezvous broker
+            Thread.sleep(1200);
+
+            GlobalRelayBridge.HandshakeResult hs = GlobalRelayBridge.connectAsSender(code, sendHandle);
+            try (GlobalRelayBridge.StreamTunnel sendTunnel = hs.tunnel()) {
+                sendTunnel.activateSenderTunnel();
+                TransferService.sendFilesOverStream(
+                        List.of(srcFile), sendTunnel.getOutputStream(), code, sendHandle, (sent, total) -> {}
+                );
+            }
+
+            List<Path> saved = receiverFuture.get(25, TimeUnit.SECONDS);
+            assertEquals(1, saved.size());
+            assertEquals(
+                    "Transferred across networks over GlobalRelayBridge with AES-256-GCM + SHA-256",
+                    Files.readString(saved.get(0), StandardCharsets.UTF_8)
+            );
+        }
+    }
 }

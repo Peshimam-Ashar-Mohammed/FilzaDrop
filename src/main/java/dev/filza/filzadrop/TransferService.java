@@ -139,24 +139,61 @@ public final class TransferService {
         if (files == null || files.isEmpty()) {
             throw new IllegalArgumentException("No files selected.");
         }
+
+        // 1. Fast LAN UDP discovery
         Optional<InetSocketAddress> lanTarget = discovery != null ? discovery.resolveCode(code) : Optional.empty();
         if (lanTarget.isPresent()) {
             InetSocketAddress addr = lanTarget.get();
-            sendFilesDirect(files, addr.getHostString(), addr.getPort(), code, handle, progress);
-            return;
+            try {
+                sendFilesDirect(files, addr.getHostString(), addr.getPort(), code, handle, progress);
+                return;
+            } catch (IOException ignored) {
+                // Fall through to relay / global bridge if direct connect failed
+            }
         }
 
+        // 2. Local/custom TCP RelayServer (if running on LAN/VPS)
         try {
             Socket relaySocket = connectRelayAsSender(code, handle);
             sendFilesOverSocket(files, relaySocket, code, handle, progress);
             return;
-        } catch (IOException relayEx) {
+        } catch (IOException ignored) {
+        }
+
+        // 3. Global Cross-Network Bridge (works across Mobile Data, CGNAT, and different Wi-Fi networks,
+        //    AND also exchanges local LAN IP in case UDP broadcast was blocked on the same Wi-Fi!)
+        try {
+            GlobalRelayBridge.HandshakeResult hs = GlobalRelayBridge.connectAsSender(code, handle);
+            // Try upgrading to direct LAN TCP first if receiver is on the same network
+            if (hs.receiverLanIp() != null && !hs.receiverLanIp().isBlank() && !"127.0.0.1".equals(hs.receiverLanIp())) {
+                try {
+                    Socket directSock = new Socket();
+                    handle.register(directSock);
+                    directSock.connect(new InetSocketAddress(hs.receiverLanIp(), hs.receiverLanPort()), 1800);
+                    directSock.setSoTimeout(30_000);
+                    hs.tunnel().close();
+                    sendFilesOverSocket(files, directSock, code, handle, progress);
+                    return;
+                } catch (IOException ignored) {
+                    // Different network / Mobile Data — proceed with global encrypted tunnel
+                }
+            }
+            try (GlobalRelayBridge.StreamTunnel tunnel = hs.tunnel()) {
+                tunnel.activateSenderTunnel();
+                sendFilesOverStream(files, tunnel.getOutputStream(), code, handle, progress);
+                return;
+            }
+        } catch (Exception globalEx) {
+            if (handle.isCancelled()) {
+                throw new CancellationException("Transfer cancelled.");
+            }
+            // Final fallback: localhost direct if testing on same machine
             try {
                 sendFilesDirect(files, "127.0.0.1", PORT, code, handle, progress);
                 return;
             } catch (Exception ignored) {
             }
-            throw new IOException("No active receiver found for code " + code + ".", relayEx);
+            throw new IOException("No active receiver found for code " + code + " on Wi-Fi or Mobile Data.", globalEx);
         }
     }
 
@@ -182,6 +219,18 @@ public final class TransferService {
             TransferHandle handle,
             BiConsumer<Long, Long> progress
     ) throws Exception {
+        try (socket) {
+            sendFilesOverStream(files, socket.getOutputStream(), code, handle, progress);
+        }
+    }
+
+    static void sendFilesOverStream(
+            List<Path> files,
+            OutputStream raw,
+            String code,
+            TransferHandle handle,
+            BiConsumer<Long, Long> progress
+    ) throws Exception {
         long totalBytes = 0;
         for (Path f : files) {
             long sz = Files.size(f);
@@ -194,8 +243,7 @@ public final class TransferService {
         byte[] salt = random(SALT), nonce = random(NONCE);
         Cipher cipher = cipher(Cipher.ENCRYPT_MODE, code, salt, nonce);
 
-        try (socket) {
-            OutputStream raw = socket.getOutputStream();
+        try {
             raw.write(salt);
             raw.write(nonce);
             raw.flush();
@@ -239,6 +287,8 @@ public final class TransferService {
         }
     }
 
+    private record IncomingChannel(InputStream in, Closeable owner) {}
+
     public static List<Path> receiveFilesAnyNetwork(
             ServerSocket server,
             String code,
@@ -250,26 +300,36 @@ public final class TransferService {
         handle.register(server);
         server.setSoTimeout(300_000);
 
-        CompletableFuture<Socket> winningSocket = new CompletableFuture<>();
+        CompletableFuture<IncomingChannel> winningChannel = new CompletableFuture<>();
+        int boundPort = server.getLocalPort();
+        String localIp = getLocalIpv4Hint();
 
+        // 1. Direct LAN / Local TCP listener
         Thread directThread = new Thread(() -> {
             try {
                 Socket s = server.accept();
+                s.setSoTimeout(120_000);
+                s.setTcpNoDelay(true);
                 handle.register(s);
-                if (!winningSocket.complete(s)) {
+                IncomingChannel ch = new IncomingChannel(s.getInputStream(), s);
+                if (!winningChannel.complete(ch)) {
                     try { s.close(); } catch (IOException ignored) {}
                 }
             } catch (IOException e) {
-                winningSocket.completeExceptionally(e);
+                winningChannel.completeExceptionally(e);
             }
         }, "filzadrop-direct-accept");
         directThread.setDaemon(true);
         directThread.start();
 
+        // 2. Local/custom TCP Relay listener
         Thread relayThread = new Thread(() -> {
             try {
                 Socket relaySock = connectRelayAsReceiver(code, handle);
-                if (!winningSocket.complete(relaySock)) {
+                relaySock.setSoTimeout(120_000);
+                relaySock.setTcpNoDelay(true);
+                IncomingChannel ch = new IncomingChannel(relaySock.getInputStream(), relaySock);
+                if (!winningChannel.complete(ch)) {
                     try { relaySock.close(); } catch (IOException ignored) {}
                 } else {
                     try { server.close(); } catch (IOException ignored) {}
@@ -280,9 +340,26 @@ public final class TransferService {
         relayThread.setDaemon(true);
         relayThread.start();
 
-        Socket socket;
+        // 3. Global Cross-Network Bridge (Mobile Data & Different Wi-Fi + LAN IP exchange)
+        Thread globalThread = new Thread(() -> {
+            try {
+                GlobalRelayBridge.StreamTunnel tunnel =
+                        GlobalRelayBridge.listenAsReceiver(code, localIp, boundPort, handle);
+                IncomingChannel ch = new IncomingChannel(tunnel.getInputStream(), tunnel);
+                if (!winningChannel.complete(ch)) {
+                    tunnel.close();
+                } else {
+                    try { server.close(); } catch (IOException ignored) {}
+                }
+            } catch (IOException ignored) {
+            }
+        }, "filzadrop-global-accept");
+        globalThread.setDaemon(true);
+        globalThread.start();
+
+        IncomingChannel channel;
         try {
-            socket = winningSocket.get();
+            channel = winningChannel.get();
         } catch (Exception e) {
             if (handle.isCancelled()) {
                 throw new CancellationException("Receive cancelled.");
@@ -290,11 +367,13 @@ public final class TransferService {
             throw e;
         }
 
-        return receiveFilesFromSocket(socket, code, directory, handle, progress);
+        try (Closeable owner = channel.owner()) {
+            return receiveFilesFromStream(channel.in(), code, directory, handle, progress);
+        }
     }
 
-    static List<Path> receiveFilesFromSocket(
-            Socket socket,
+    static List<Path> receiveFilesFromStream(
+            InputStream raw,
             String code,
             Path directory,
             TransferHandle handle,
@@ -302,52 +381,46 @@ public final class TransferService {
     ) throws Exception {
         Files.createDirectories(directory);
         List<Path> savedFiles = new ArrayList<>();
-        try (socket) {
-            socket.setSoTimeout(120_000);
-            socket.setTcpNoDelay(true);
-            InputStream raw = socket.getInputStream();
-            byte[] salt = readExactly(raw, SALT), nonce = readExactly(raw, NONCE);
-            Cipher cipher = cipher(Cipher.DECRYPT_MODE, code, salt, nonce);
+        byte[] salt = readExactly(raw, SALT), nonce = readExactly(raw, NONCE);
+        Cipher cipher = cipher(Cipher.DECRYPT_MODE, code, salt, nonce);
 
-            try (DataInputStream in = new DataInputStream(new CipherInputStream(raw, cipher))) {
-                String firstToken = in.readUTF();
-                if (MULTI_HEADER_MAGIC.equals(firstToken)) {
-                    int fileCount = in.readInt();
-                    long totalBytes = in.readLong();
-                    if (fileCount < 1 || fileCount > 500 || totalBytes < 0 || totalBytes > MAX_BYTES) {
-                        throw new IOException("Invalid multi-file header.");
-                    }
-                    long totalGot = 0;
-                    for (int i = 0; i < fileCount; i++) {
-                        String rawName = in.readUTF();
-                        long fileSize = in.readLong();
-                        Path saved = receiveSingleStreamedFile(in, directory, rawName, fileSize, true, handle, gotInFile -> {
-                            progress.accept( gotInFile, totalBytes);
-                        }, totalGot);
-                        totalGot += fileSize;
-                        savedFiles.add(saved);
-                    }
-                } else {
-                    // Backward-compatible single file protocol (used by Android v1)
+        try (DataInputStream in = new DataInputStream(new CipherInputStream(raw, cipher))) {
+            String firstToken = in.readUTF();
+            if (MULTI_HEADER_MAGIC.equals(firstToken)) {
+                int fileCount = in.readInt();
+                long totalBytes = in.readLong();
+                if (fileCount < 1 || fileCount > 500 || totalBytes < 0 || totalBytes > MAX_BYTES) {
+                    throw new IOException("Invalid multi-file header.");
+                }
+                long totalGot = 0;
+                for (int i = 0; i < fileCount; i++) {
+                    String rawName = in.readUTF();
                     long fileSize = in.readLong();
-                    Path saved = receiveSingleStreamedFile(in, directory, firstToken, fileSize, false, handle, got -> {
-                        progress.accept(got, fileSize);
-                    }, 0L);
+                    Path saved = receiveSingleStreamedFile(in, directory, rawName, fileSize, true, handle, gotInFile -> {
+                        progress.accept(gotInFile, totalBytes);
+                    }, totalGot);
+                    totalGot += fileSize;
                     savedFiles.add(saved);
                 }
-                if (in.read() != -1) {
-                    throw new IOException("Unexpected trailing data after payload.");
-                }
-                return savedFiles;
-            } catch (Exception e) {
-                for (Path p : savedFiles) {
-                    try { Files.deleteIfExists(p); } catch (IOException ignored) {}
-                }
-                if (handle.isCancelled()) {
-                    throw new CancellationException("Receive cancelled.");
-                }
-                throw new IOException("Transfer rejected or interrupted: " + e.getMessage(), e);
+            } else {
+                long fileSize = in.readLong();
+                Path saved = receiveSingleStreamedFile(in, directory, firstToken, fileSize, false, handle, got -> {
+                    progress.accept(got, fileSize);
+                }, 0L);
+                savedFiles.add(saved);
             }
+            if (in.read() != -1) {
+                throw new IOException("Unexpected trailing data after payload.");
+            }
+            return savedFiles;
+        } catch (Exception e) {
+            for (Path p : savedFiles) {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            }
+            if (handle.isCancelled()) {
+                throw new CancellationException("Receive cancelled.");
+            }
+            throw new IOException("Transfer rejected or interrupted: " + e.getMessage(), e);
         }
     }
 
@@ -358,7 +431,7 @@ public final class TransferService {
             long size,
             boolean expectSha256,
             TransferHandle handle,
-             java.util.function.LongConsumer totalProgress,
+            java.util.function.LongConsumer totalProgress,
             long baseOffset
     ) throws Exception {
         String name = safeName(rawName);
@@ -412,7 +485,7 @@ public final class TransferService {
     private static Socket connectRelayAsReceiver(String code, TransferHandle handle) throws IOException {
         Socket s = new Socket();
         handle.register(s);
-        s.connect(new InetSocketAddress(relayHost, relayPort), 5_000);
+        s.connect(new InetSocketAddress(relayHost, relayPort), 3_000);
         s.setSoTimeout(300_000);
         DataOutputStream out = new DataOutputStream(s.getOutputStream());
         DataInputStream in = new DataInputStream(s.getInputStream());
@@ -435,7 +508,7 @@ public final class TransferService {
     private static Socket connectRelayAsSender(String code, TransferHandle handle) throws IOException {
         Socket s = new Socket();
         handle.register(s);
-        s.connect(new InetSocketAddress(relayHost, relayPort), 5_000);
+        s.connect(new InetSocketAddress(relayHost, relayPort), 2_000);
         s.setSoTimeout(60_000);
         DataOutputStream out = new DataOutputStream(s.getOutputStream());
         DataInputStream in = new DataInputStream(s.getInputStream());

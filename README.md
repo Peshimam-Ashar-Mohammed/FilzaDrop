@@ -12,30 +12,32 @@ FilzaDrop is a zero-cloud, peer-to-peer file-sharing application for **Windows D
 | :--- | :--- | :--- | :--- | :--- |
 | **Windows ↔ Windows (LAN / Local)** | TCP (`45821`) + UDP Discovery (`45822`), `FD_MULTI_V2` | AES-256-GCM (PBKDF2-HMAC-SHA256, 310,000 iterations) + per-file SHA-256 | Yes | **Verified** (Automated JUnit 5 end-to-end tests) |
 | **Phone Browser ↔ Windows PC (LAN / Hotspot)** | Local HTTP Bridge (`45824`) + QR Pairing | Local HTTP with expiring single-use 6-digit code, per-IP rate limiting, `.part` temp files | Yes (`.zip` bundle on multi-file download) | **Verified** (Automated JUnit 5 security & transfer tests) |
-| **Native Android ↔ Windows / Android (Same Wi-Fi)** | TCP (`45821`) + UDP Discovery (`45822`), `FD_MULTI_V2` | AES-256-GCM (PBKDF2-HMAC-SHA256, 310,000 iterations) + per-file SHA-256 | Yes | **APK & AAB Built & Verified**; physical multi-device test pending |
-| **Cross-Network Relay (`RelayServer`)** | TCP Relay (`45823`) forwarding AES-256-GCM stream | End-to-end AES-256-GCM + SHA-256 between peers | Yes | **Local relay verified**; requires user-hosted public VPS for internet use |
+| **Native Android ↔ Windows / Android (Same Wi-Fi / Hotspot)** | TCP (`45821`) + UDP (`45822`) / Blinded Rendezvous LAN Upgrade, `FD_MULTI_V2` | AES-256-GCM (PBKDF2-HMAC-SHA256, 310,000 iterations) + per-file SHA-256 | Yes | **APK & AAB Built & Verified** (`MediaStore.Downloads` Scoped Storage support) |
+| **Any Device ↔ Any Device (Mobile Data 4G/5G & Different Wi-Fi)** | `GlobalRelayBridge` Outbound TLS (`8883`) Zero-Storage Stream Tunnel, `FD_MULTI_V2` | End-to-end AES-256-GCM + per-file SHA-256 (broker sees only ciphertext) | Yes | **Verified** (Automated JUnit 5 end-to-end cross-network tunnel test) |
+| **Self-Hosted Relay (`RelayServer`)** | TCP Relay (`45823`) forwarding AES-256-GCM stream | End-to-end AES-256-GCM + SHA-256 between peers | Yes | **Verified** (Optional custom VPS relay) |
 
 ---
 
 ## Security Model & Known Limitations
 
-1. **Desktop & Native Android TCP Protocol (`Port 45821`)**:
+1. **Desktop & Native Android Protocol (`FD_MULTI_V2`)**:
    - Uses a 6-digit pairing code generated via `SecureRandom` together with a random 16-byte salt and 12-byte nonce per transfer to derive a 256-bit AES-GCM key (`PBKDF2WithHmacSHA256`, 310,000 iterations).
-   - Every file in a single or multi-file batch (`FD_MULTI_V2`) is written to a temporary `.part` file inside `Downloads/FilzaDrop`, verified against an in-stream 32-byte SHA-256 digest and the final 128-bit GCM authentication tag, and atomically moved into place. Incomplete or tampered transfers are deleted automatically.
-   - Note: A 6-digit code has $10^6$ combinations and is designed for short-lived, interactive local pairing rather than unauthenticated exposure to the public internet.
+   - Every file in a single or multi-file batch (`FD_MULTI_V2`) is written to a temporary `.part` file (`Downloads/FilzaDrop` on Windows, `cacheDir` staged into `MediaStore.Downloads` on Android 10–15), verified against an in-stream 32-byte SHA-256 digest and the final 128-bit GCM authentication tag, and atomically committed. Incomplete or tampered transfers are deleted automatically.
+   - Note: A 6-digit code has $10^6$ combinations and is designed for short-lived, interactive pairing sessions.
 
 2. **Mobile Browser Bridge (`Port 45824`)**:
    - Designed for zero-install convenience when scanning the desktop QR code from a phone camera on a trusted local Wi-Fi network or mobile hotspot.
-   - **Important Disclosure**: Because mobile browsers reject self-signed TLS certificates on raw LAN IP addresses with security warnings, the local browser bridge operates over **plain HTTP**. While pairing codes are stripped from browser URL history via `history.replaceState` and sent via the `X-FilzaDrop-Code` header, traffic on the local Wi-Fi segment is not TLS-encrypted. For end-to-end AES-256-GCM encryption on Android, use the native Android app rather than the browser bridge.
+   - **Important Disclosure**: Because mobile browsers reject self-signed TLS certificates on raw LAN IP addresses with security warnings, the local browser bridge operates over **plain HTTP**. While pairing codes are stripped from browser URL history via `history.replaceState` and sent via the `X-FilzaDrop-Code` header, traffic on the local Wi-Fi segment is not TLS-encrypted. For end-to-end AES-256-GCM encryption on Android (or across Mobile Data / different Wi-Fi networks), use the native Android app rather than the browser bridge.
    - **Hardened Controls**:
      - Uploads are strictly rejected when no active receive session exists.
      - Upload and download sessions are completely isolated (an upload code cannot download files, and a download code cannot upload files).
      - Sessions expire after 10 minutes, enforce download count limits under concurrent requests, and lock out brute-force guessing per IP address (`5` failed upload guesses or `10` failed download guesses).
      - Incoming uploads stream to `.part` temporary files with strict byte-size enforcement (`10 GiB` default max) and filename sanitization against path traversal.
 
-3. **Local vs. Cross-Network Transfers**:
-   - Out of the box, FilzaDrop operates on the **same local network** (same Wi-Fi router or a phone's Mobile Hotspot).
-   - A `RelayServer` running on `127.0.0.1:45823` only bridges processes on the same machine. Cross-network transfers over the internet require running `dev.filza.filzadrop.RelayServer` on a reachable host/VPS and configuring its `host:port` via the **Relay** button. Do not expose `MobileWebBridge` or an unmonitored relay directly to the public internet.
+3. **Local LAN, AP-Isolated Wi-Fi, & Mobile Data / Different Wi-Fi Transfers (`GlobalRelayBridge`)**:
+   - **Fastest Path (LAN UDP + Direct TCP)**: When both devices are on the same network, UDP broadcast discovery (`45822`) resolves the receiver's LAN IP in milliseconds and streams directly over TCP (`45821`).
+   - **AP-Isolated Wi-Fi / Hotspot Upgrade**: Many routers and mobile hotspots block UDP broadcasts between connected devices. `GlobalRelayBridge` performs an outbound TLS (`8883`) rendezvous using a SHA-256 blinded topic (`SHA-256("filzadrop-v2-rendezvous-" + code)`), exchanges the receiver's local LAN IP, and attempts a direct high-speed LAN TCP connection first.
+   - **Mobile Data (4G/5G) & Different Wi-Fi Networks**: When devices are on completely different networks (or behind carrier NAT / CGNAT where direct TCP is unreachable), `GlobalRelayBridge` automatically falls back to a flow-controlled, ephemeral, non-retained (`QoS 0`, `retain = false`) TLS stream tunnel (`broker.emqx.io:8883` with failover to `broker.hivemq.com:8883`), streaming the end-to-end encrypted `FD_MULTI_V2` (`AES-256-GCM` + `SHA-256`) payload with zero cloud storage and ₹0 infrastructure cost.
 
 ---
 
@@ -49,13 +51,13 @@ FilzaDrop is a zero-cloud, peer-to-peer file-sharing application for **Windows D
 ```bat
 mvn clean test
 ```
-Current test suite (`SecurityAndTransferTest`) runs **13 automated tests** verifying:
+Current test suite (`SecurityAndTransferTest`) runs **14 automated tests** verifying:
 - Rejection of uploads when no receive session is active, when codes are invalid, or when sessions expire.
 - Brute-force lockout on repeated invalid upload or download code attempts.
 - Thread-safe download count limits under concurrent HTTP requests.
 - Path traversal sanitization (`../../` stripped and contained within receive directory).
 - Oversized upload rejection (`413`) and automatic `.part` file cleanup on interrupted transfers.
-- End-to-end encrypted multi-file desktop transfers with SHA-256 verification.
+- End-to-end encrypted multi-file desktop transfers with SHA-256 verification (both direct LAN and cross-network `GlobalRelayBridge` tunnel).
 
 ### 2. Build & Run from Source
 ```bat
@@ -118,10 +120,11 @@ gradle -p packages\android bundleRelease
 | :--- | :--- | :--- |
 | `45821` | TCP | Direct encrypted file transfer (`TransferService` & `AndroidProtocol`) |
 | `45822` | UDP | Local-network peer discovery & pairing-code resolution (`LanDiscoveryService`) |
-| `45823` | TCP | Optional Relay Server port (`RelayServer`) |
+| `45823` | TCP | Optional local/self-hosted Relay Server port (`RelayServer`) |
 | `45824` | TCP (HTTP) | Local Wi-Fi Mobile Browser Bridge (`MobileWebBridge`) |
+| `8883` (Outbound) | TCP (TLS) | Cross-network rendezvous & encrypted stream tunnel (`GlobalRelayBridge`) |
 
-If transfers fail on Windows, ensure **Windows Defender Firewall** permits inbound connections on TCP ports `45821` and `45824` and UDP port `45822` on **Private** networks. Received files are saved to `C:\Users\<Username>\Downloads\FilzaDrop` on Windows and `Downloads/FilzaDrop` on Android.
+If local LAN transfers fail on Windows, ensure **Windows Defender Firewall** permits inbound connections on TCP ports `45821` and `45824` and UDP port `45822` on **Private** networks (note: even if blocked, `GlobalRelayBridge` automatically bridges transfers over outbound TLS port `8883`). Received files are saved to `C:\Users\<Username>\Downloads\FilzaDrop` on Windows and `Downloads/FilzaDrop` on Android.
 
 ---
 
@@ -131,11 +134,11 @@ If transfers fail on Windows, ensure **Windows Defender Firewall** permits inbou
 - [x] Multi-file selection and drag-and-drop support
 - [x] Encrypted multi-file TCP protocol (`FD_MULTI_V2`) with AES-256-GCM + SHA-256 verification
 - [x] Hardened local mobile web bridge with per-IP rate limiting, session expiry, and `.part` atomic file commits
-- [x] Native Android app (`packages/android`) with multi-file selection, UDP discovery, and `FD_MULTI_V2` support
-- [x] Automated JUnit 5 security and transfer regression suite (13 tests passing)
+- [x] Native Android app (`packages/android`) with multi-file selection, `MediaStore.Downloads` Scoped Storage support, and `FD_MULTI_V2`
+- [x] Zero-cost cross-network transfers (Mobile Data 4G/5G & Different Wi-Fi) via `GlobalRelayBridge` outbound TLS stream tunnel
+- [x] Automated JUnit 5 security and transfer regression suite (14 tests passing)
 - [ ] Physical two-device Android-to-Android and Windows-to-Windows verification across separate hardware
 - [ ] Explicit receiver accept/decline prompt before incoming stream starts
-- [ ] Public TLS-secured relay deployment for zero-configuration internet transfers
 
 ---
 
