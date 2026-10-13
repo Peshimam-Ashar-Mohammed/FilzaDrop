@@ -139,6 +139,7 @@ fun FilzaDropScreen() {
             AndroidProtocol.runDiscoveryLoop(
                 deviceName = Build.MODEL ?: "Android",
                 getActiveCode = { activeCode.filter { it.isDigit() } },
+                getActivePort = { activeServerSocket?.localPort ?: AndroidProtocol.PORT },
                 onPeer = { peer ->
                     if (peer.activeCode.isNotEmpty()) {
                         codeDirectory[peer.activeCode] = InetSocketAddress(peer.ip, peer.port)
@@ -175,6 +176,63 @@ fun FilzaDropScreen() {
         qrBitmap = null
         progress = 0f
         statusText = "Cancelled"
+    }
+
+    fun beginReceiving(sourceLabel: String) {
+        if (isSending || isReceiving) return
+        val code = String.format("%06d", SecureRandom().nextInt(1_000_000))
+        activeCode = "${code.substring(0, 3)} ${code.substring(3)}"
+        qrBitmap = AndroidProtocol.generateQrBitmap(code, 240)
+        isReceiving = true
+        cancelFlag.set(false)
+        statusText = "Listening for $sourceLabel on Wi-Fi & Mobile Data (code $code)…"
+        activeJob = scope.launch(Dispatchers.IO) {
+            try {
+                val boundServer = try {
+                    ServerSocket(AndroidProtocol.PORT)
+                } catch (_: IOException) {
+                    ServerSocket(0)
+                }
+                activeServerSocket = boundServer
+                val savedNames = AndroidProtocol.receiveFilesAnyNetwork(
+                    context = context,
+                    server = boundServer,
+                    code = code,
+                    cancelFlag = cancelFlag,
+                    registerClosable = { activeClosable = it }
+                ) { got, total ->
+                    progress = if (total > 0) got.toFloat() / total else 0f
+                }
+                withContext(Dispatchers.Main) {
+                    isReceiving = false
+                    activeCode = "— — — — — —"
+                    qrBitmap = null
+                    progress = 1f
+                    statusText = "Saved ${savedNames.size} file(s) to Downloads/FilzaDrop"
+                    dialogState = TransferDialogState(
+                        true,
+                        "Transfer Complete",
+                        "Verified SHA-256 and saved to Downloads/FilzaDrop:\n" +
+                            savedNames.joinToString("\n") { "• $it" }
+                    )
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isReceiving = false
+                    activeCode = "— — — — — —"
+                    qrBitmap = null
+                    progress = 0f
+                    if (!cancelFlag.get()) {
+                        statusText = "Receive failed"
+                        dialogState = TransferDialogState(
+                            false,
+                            "Transfer Failed",
+                            e.message ?: "Transfer rejected or interrupted."
+                        )
+                    }
+                }
+            }
+        }
     }
 
     dialogState?.let { dlg ->
@@ -255,8 +313,8 @@ fun FilzaDropScreen() {
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Send", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text("Select one or multiple files and enter the 6-digit code", color = Color(0xFF786A96), fontSize = 11.sp)
+                Text("Send to Android or PC", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("Select one or multiple files and enter the receiver's 6-digit code", color = Color(0xFF786A96), fontSize = 11.sp)
 
                 val selectionSummary = remember(selectedFiles) {
                     if (selectedFiles.isEmpty()) {
@@ -387,8 +445,8 @@ fun FilzaDropScreen() {
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Receive", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text("Share this 6-digit code with the sender (works on Wi-Fi or Mobile Data)", color = Color(0xFF786A96), fontSize = 11.sp)
+                Text("Receive from Android or PC", color = Color(0xFFF2ECFF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text("Tap a button below to get a 6-digit code (works on Wi-Fi, Hotspot & Mobile Data)", color = Color(0xFF786A96), fontSize = 11.sp)
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -425,73 +483,26 @@ fun FilzaDropScreen() {
                 }
 
                 if (!isReceiving) {
-                    Button(
-                        onClick = {
-                            if (isSending) return@Button
-                            val code = String.format("%06d", SecureRandom().nextInt(1_000_000))
-                            activeCode = "${code.substring(0, 3)} ${code.substring(3)}"
-                            qrBitmap = AndroidProtocol.generateQrBitmap(code, 240)
-                            isReceiving = true
-                            cancelFlag.set(false)
-                            statusText = "Listening on Wi-Fi & Mobile Data (code $code)…"
-                            activeJob = scope.launch(Dispatchers.IO) {
-                                try {
-                                    val server = ServerSocket(0).apply {
-                                        try {
-                                            close()
-                                        } catch (_: Exception) {}
-                                    }
-                                    val boundServer = try {
-                                        ServerSocket(AndroidProtocol.PORT)
-                                    } catch (_: IOException) {
-                                        ServerSocket(0)
-                                    }
-                                    activeServerSocket = boundServer
-                                    val savedNames = AndroidProtocol.receiveFilesAnyNetwork(
-                                        context = context,
-                                        server = boundServer,
-                                        code = code,
-                                        cancelFlag = cancelFlag,
-                                        registerClosable = { activeClosable = it }
-                                    ) { got, total ->
-                                        progress = if (total > 0) got.toFloat() / total else 0f
-                                    }
-                                    withContext(Dispatchers.Main) {
-                                        isReceiving = false
-                                        activeCode = "— — — — — —"
-                                        qrBitmap = null
-                                        progress = 1f
-                                        statusText = "Saved ${savedNames.size} file(s) to Downloads/FilzaDrop"
-                                        dialogState = TransferDialogState(
-                                            true,
-                                            "Transfer Complete",
-                                            "Verified SHA-256 and saved to Downloads/FilzaDrop:\n" +
-                                                savedNames.joinToString("\n") { "• $it" }
-                                        )
-                                    }
-                                } catch (e: Exception) {
-                                    withContext(Dispatchers.Main) {
-                                        isReceiving = false
-                                        activeCode = "— — — — — —"
-                                        qrBitmap = null
-                                        progress = 0f
-                                        if (!cancelFlag.get()) {
-                                            statusText = "Receive failed"
-                                            dialogState = TransferDialogState(
-                                                false,
-                                                "Transfer Failed",
-                                                e.message ?: "Transfer rejected or interrupted."
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        },
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("Listen for Files", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Button(
+                            onClick = { beginReceiving("Android") },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6D28D9))
+                        ) {
+                            Text("Receive from Android", fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = { beginReceiving("PC") },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E1533))
+                        ) {
+                            Text("Receive from PC", color = Color(0xFFE9D5FF), fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+                        }
                     }
                 } else {
                     Button(
@@ -710,6 +721,7 @@ object AndroidProtocol {
     suspend fun runDiscoveryLoop(
         deviceName: String,
         getActiveCode: () -> String,
+        getActivePort: () -> Int,
         onPeer: (PeerDevice) -> Unit
     ) = coroutineScope {
         val safeDeviceName = deviceName.replace("|", "_")
@@ -730,7 +742,8 @@ object AndroidProtocol {
             while (isActive) {
                 try {
                     val code = getActiveCode().ifEmpty { "-" }
-                    val msg = "FILZADROP|2|$safeDeviceName|$PORT|Android|$code"
+                    val port = getActivePort()
+                    val msg = "FILZADROP|2|$safeDeviceName|$port|Android|$code"
                     sendBroadcastOverAllInterfaces(socket, msg.toByteArray(Charsets.UTF_8))
                 } catch (_: Exception) {}
                 delay(2000)
@@ -746,8 +759,9 @@ object AndroidProtocol {
                 if (text.startsWith("FILZADROP_WHOHAS|")) {
                     val wanted = text.substringAfter("FILZADROP_WHOHAS|").trim()
                     val current = getActiveCode()
+                    val port = getActivePort()
                     if (wanted.isNotEmpty() && wanted == current) {
-                        val reply = "FILZADROP|2|$safeDeviceName|$PORT|Android|$current".toByteArray(Charsets.UTF_8)
+                        val reply = "FILZADROP|2|$safeDeviceName|$port|Android|$current".toByteArray(Charsets.UTF_8)
                         socket.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
                         socket.send(DatagramPacket(reply, reply.size, packet.address, DISCOVERY_PORT))
                     }

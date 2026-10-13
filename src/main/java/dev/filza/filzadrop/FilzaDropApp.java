@@ -474,16 +474,38 @@ public class FilzaDropApp extends Application {
         progressText.setText("Connecting");
         setStatus("Sending " + filesToSend.size() + " file(s)…");
 
+        final java.util.concurrent.CompletableFuture<Void> browserPickup = (mobileWebBridge != null)
+                ? mobileWebBridge.getDownloadPickupFuture(code)
+                : new java.util.concurrent.CompletableFuture<>();
+
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() throws Exception {
-                TransferService.sendFilesByCode(
-                        filesToSend,
-                        code,
-                        discoveryService,
-                        activeHandle,
-                        (sent, total) -> Platform.runLater(() -> updateProgressUI(sent, total))
-                );
+                browserPickup.thenRun(() -> {
+                    if (activeHandle != null) {
+                        activeHandle.cancel();
+                    }
+                });
+                try {
+                    TransferService.sendFilesByCode(
+                            filesToSend,
+                            code,
+                            discoveryService,
+                            activeHandle,
+                            (sent, total) -> Platform.runLater(() -> updateProgressUI(sent, total))
+                    );
+                } catch (Exception ex) {
+                    if (browserPickup.isDone()) {
+                        return null;
+                    }
+                    // Wait briefly in case phone browser is polling /receive-status right now
+                    try {
+                        browserPickup.get(1500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        return null;
+                    } catch (Exception ignored) {
+                    }
+                    throw ex;
+                }
                 return null;
             }
         };

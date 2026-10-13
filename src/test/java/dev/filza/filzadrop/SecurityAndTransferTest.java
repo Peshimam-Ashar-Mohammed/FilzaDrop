@@ -451,4 +451,56 @@ class SecurityAndTransferTest {
             );
         }
     }
+
+    // 17. Android-to-Android / PC-to-Android receive session generates code without requiring input and delivers file
+    @Test
+    void androidToAndroidReceiveSessionGeneratesCodeAndTransfersFiles(@TempDir Path tempDir) throws Exception {
+        try (MobileWebBridge bridge = new MobileWebBridge(tempDir, list -> {})) {
+            bridge.start(0);
+            int port = bridge.getBoundPort();
+            HttpClient client = HttpClient.newHttpClient();
+
+            // 1. Receiving Android taps "Receive from Android" without entering any code
+            HttpRequest createSessionReq = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:" + port + "/receive-session"))
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build();
+            HttpResponse<String> sessionRes = client.send(createSessionReq, HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, sessionRes.statusCode());
+            assertTrue(sessionRes.body().contains("\"status\":\"waiting\""));
+
+            // Extract generated 6-digit code
+            String body = sessionRes.body();
+            int codeIdx = body.indexOf("\"code\":\"") + 8;
+            String generatedCode = body.substring(codeIdx, codeIdx + 6);
+            assertTrue(generatedCode.matches("\\d{6}"));
+
+            // 2. Sending Android uploads file with that generated 6-digit code
+            HttpRequest uploadReq = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:" + port + "/upload?name=phone-to-phone.txt&last=1&forward=1"))
+                    .header("X-FilzaDrop-Code", generatedCode)
+                    .POST(HttpRequest.BodyPublishers.ofString("Android to Android payload"))
+                    .build();
+            HttpResponse<String> uploadRes = client.send(uploadReq, HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, uploadRes.statusCode());
+
+            // 3. Receiving Android polls /receive-status and sees ready
+            HttpRequest statusReq = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:" + port + "/receive-status?code=" + generatedCode))
+                    .GET()
+                    .build();
+            HttpResponse<String> statusRes = client.send(statusReq, HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, statusRes.statusCode());
+            assertTrue(statusRes.body().contains("\"status\":\"ready\""));
+
+            // 4. Receiving Android downloads the file automatically
+            HttpRequest downloadReq = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:" + port + "/download?code=" + generatedCode))
+                    .GET()
+                    .build();
+            HttpResponse<String> downloadRes = client.send(downloadReq, HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, downloadRes.statusCode());
+            assertEquals("Android to Android payload", downloadRes.body());
+        }
+    }
 }
